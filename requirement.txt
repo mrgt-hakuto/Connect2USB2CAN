@@ -1,0 +1,4 @@
+python-can>=4.0
+pyserial>=3.5
+pyusb; platform_system == "Windows"
+gs_usb; platform_system == "Windows"
