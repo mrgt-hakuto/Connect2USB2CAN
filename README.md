@@ -15,6 +15,7 @@ pip install -r requirement.txt
 2. ダウンロードしたexeファイルを実行し、メニューの「Options」>「List All Devices」にチェックを入れる。
 3. ドロップダウンリストから「USB2CAN V3.3」と書かれているものを選択。
 4. Driverの右側（書き換え後）を「WinUSB」に設定し、「Replace Driver」または「Install Driver」をクリックする。
+5. Driverの右側（書き換え後）を「libusb-win32」・「libusbK」にそれぞれ設定し、再度4を実行。
 
 # 3. 実行
 ## 3.1 サンプルプログラム
