@@ -3,14 +3,14 @@ import sys
 
 def main():
     # USB2CANのCAN0へ接続
-    bus = connect2USB2CAN(channel = 0)
+    bus = connect2USB2CAN(channel = 1)
     if bus is None:
         print("CANバスの接続に失敗したため、処理を中断します。")
         sys.exit()
 
     # モーターへ命令を送信
     try:
-        arbitration_id = 0x032a
+        arbitration_id = 0x032b
         data = [0x00, 0x00, 0x13, 0x88]
 
         send2Morter(bus, arbitration_id, data)
