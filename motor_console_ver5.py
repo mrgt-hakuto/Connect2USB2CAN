@@ -1,24 +1,28 @@
 """
-motor_console.py -- CubeMars 対話コンソール v4
+motor_console_ver5.py -- CubeMars 対話コンソール v5
 
 cubemars.py を使う。全制御モードを物理単位で叩けて、指令は定周期で送られ、
 必ず自動停止し、フィードバックは解釈された状態で表示される。
+ver4 は原状のまま残してある（動くものを壊さないため）。
 
-v3 → v4 の追加:
-  ・サーボ全モードに対応（duty / current / brake / velocity / position /
-    set_origin / pos-speed）。以前は position/velocity/current だけだった
-  ・位置-速度ループ (ps) を追加。最高速度と加速度を指定できるので位置モードより安全
-  ・MIT モードの正しいエンコーダ（float→uint 線形マッピング）※CAN ID方式は未検証
-  ・複数モーター対応: scan でバス上のIDを探し、id で操作対象を切り替え
-  ・フェイルセーフ: 指令中にフィードバックが途切れたら自動停止
-  ・CSV ログ（log コマンド）。sim-to-real の追従検証用
-  ・任意フレーム送信 (send)。プロトコル調査用に生のIDとバイトを直接投げられる
+v4 → v5 の追加:
+  ・mscheme … MIT の CAN ID 方式をその場で切り替える。cubemars.py を編集して
+    再起動する必要がなくなった（std / ext / extid の3方式）
+  ・mprobe  … 3方式を総当たりし、enable の前後で受信フレームを比べる。
+    チェックリスト A8（MIT の CAN ID 方式）の判定材料を1コマンドで出す
+  ・mrx     … MIT 応答の解釈を ON/OFF。v4 までは parse_mit_reply が受信ループから
+    一度も呼ばれておらず、MIT が有効でも状態が更新されなかった
+  ・hz      … 定期フィードバックのレートと帯域を実測（チェックリスト A1 / A11）
+  ・x が MIT にも効くようになった。v4 まではサーボ用の速度0しか送っておらず、
+    MIT モードのモーターには停止が効かなかった
+  ・ヘルプを「実際に打てる数字入りの例」に書き換え（山括弧のプレースホルダを廃止）
 
 ⚠ 安全
   ・脚は外す/吊る/固定してから。電源をすぐ落とせる状態で。
   ・c（電流＝トルク指令）は位置/速度ループを通らないので無負荷で暴走します。
     実機の脚では ps（位置-速度）か p（位置）を使ってください。
   ・すべての指令は指定秒で自動停止します。Ctrl+C でも停止指令を出してから閉じます。
+  ・x はソフト停止です。本当の非常停止は電源を切ること。
 """
 
 import sys
@@ -32,7 +36,15 @@ import cubemars as cm
 CHANNEL = 1              # 実測: ch=0 は接続できるが通信できない
 BITRATE = 1_000_000
 DEFAULT_MOTOR_ID = 43    # 実測: フィードバック ID=0x292B の下位8bit
-MODEL = "AK10-9"
+MODEL = "AK80-9"         # ID43 の実機は AK80-9。model コマンドで切り替えられる
+                         # ERPM換算は両機種とも 31.5 で同じだが、MIT のトルクレンジが
+                         # ±65（AK10-9）と ±18（AK80-9）で 3.6 倍違うので取り違えないこと
+
+
+def set_model(name):
+    """操作対象のモデルを実行時に切り替える"""
+    global MODEL
+    MODEL = name
 
 SEND_HZ = 50
 
@@ -44,37 +56,59 @@ LIM_KP        = 50.0
 LIM_KD        = 3.0
 LIM_TORQUE    = 5.0
 
-HELP = """
-状態
-  ?                    このヘルプ
-  s                    現在の状態を1回表示
-  m [秒]               指令せず状態だけ監視（既定3秒）
-  scan [秒]            バス上のモーターIDを探す（既定2秒）
-  id <n>               操作対象のモーターIDを変える
-  raw on|off           受信フレームの生ログ表示
-  log <ファイル名>|off  状態をCSVに記録
+HELP = f"""
+すべて「実際に打てる形」で書いてあります。そのままコピーして数字だけ変えてください。
+角度は出力軸の deg、MIT だけ rad。時間の単位は秒。
 
-サーボモード指令（指定秒だけ50Hzで送信し、終了時に必ず停止）
-  p  <deg> [秒]                   絶対位置へ
-  r  <deg> [秒]                   今の位置から相対移動
-  ps <deg> <ERPM> <加速度> [秒]    位置-速度ループ（速度制限付き。実機ではこれ推奨）
-  v  <ERPM> [秒]                  速度
-  vd <deg/s> [秒]                 速度を出力軸 deg/s で指定
-  c  <A> [秒]                     電流(トルク) ⚠無負荷で暴走。既定0.3秒
-  brake <A> [秒]                  ブレーキ電流
-  duty <-1..1> [秒]               デューティー比
-  o  [0|1]                        今の位置を原点に定義（0:一時 1:恒久）※軸は動かない
+状態を見る（軸は動かない）
+  ?                     このヘルプをもう一度出す
+  s                     今の状態を1行表示（位置・速度・電流・温度・エラー）
+  m 3                   3秒間、指令せず状態だけ流し見る
+  scan 2                バス上のモーターIDを2秒探す
+  id 43                 操作対象のモーターIDを 43 にする
+  model AK80-9          操作対象の機種を切り替え（MITのトルクレンジが変わる）
+  hz 5                  定期フィードバックのレートを5秒測る（→ 制御周期の上限が分かる）
+  raw on                受信フレームを生で表示（戻すのは raw off）
+  log bench.csv         状態を bench.csv に記録（止めるのは log off）
 
-MITモード（CAN ID 方式が未検証。反応が無ければ cubemars.py の MIT_* を切り替える）
-  me                              enable（制御開始前に必要）
-  md                              disable
-  mz                              現在位置をゼロに
-  mit <pos_rad> <vel> <kp> <kd> <tau> [秒]
+サーボ指令（指定秒だけ {SEND_HZ}Hz で送り、終わると必ず停止する）
+  p 90 2                90度へ動かして2秒保持（絶対位置。今の原点が基準）
+  p 0 2                 0度へ戻す
+  r -30 2               今の位置から -30度 動かして2秒
+  ps 90 2000 5000 3     90度へ。最高2000ERPM・加速度5000ERPM/s で3秒
+                        ★ 速度が制限されるので実機の脚ではこれを使う
+  v 5000 2              5000ERPM（= 159 deg/s）で2秒回す
+  vd 159 2              159 deg/s（= 5000ERPM）で2秒回す
+  c 0.8 0.3             0.8A を0.3秒 ⚠位置/速度ループを通らないので無負荷では暴走する
+                        （実測: 起動しきい値は約0.63A、c 0.8 を1秒で約3回転した）
+  brake 0.5 0.5         ブレーキ電流 0.5A を0.5秒
+  duty 0.05 0.3         デューティー比 0.05 を0.3秒
+  o 0                   今いる位置を原点に定義し直す（0=一時 1=恒久）※軸は動かない
+
+MITモード（CAN ID 方式は未確定。まず mprobe で当たりを付ける）
+  mscheme               今の方式と、3方式それぞれの送信IDを表示（何も送らない）
+  mscheme ext           方式を ext に切り替え（拡張29bit・ID=0x82B）
+  mprobe 1              3方式を各1秒で総当たり（enable を送る。軸は動かない）
+  mrx on                未知フレームをMIT応答として解釈（戻すのは mrx off）
+  me                    enable（MIT で動かす前に必要）
+  md                    disable
+  mz                    今の位置をMITのゼロ点にする
+  mit 1.57 0 20 1 0 2   1.57rad(=90度) へ Kp=20 Kd=1 トルク前置0 で2秒
 
 その他
-  send <hexID> <hexバイト...>      任意フレームを1回送る 例: send 32B 00 00 13 88
-  x                               非常停止（既知の全モーターへ速度0）
-  q                               終了
+  send 32B 00 00 13 88  任意フレームを1回送る（この例はサーボ速度5000ERPM）
+  x                     停止（速度0、MIT有効なら零トルク+disable も送る）
+  q                     停止指令を出して終了
+
+換算メモ
+  1 deg/s = 31.5 ERPM     5000 ERPM = 159 deg/s = 26.5 rpm（出力軸）
+  1.57 rad = 90 度        3.14 rad = 180 度
+  位置は出力軸の積算角。±3276.7 deg で頭打ちするので、長く回す前に o で原点を戻す
+
+安全上限（超える指令は拒否される）
+  電流 {LIM_CURRENT_A} A / {LIM_ERPM} ERPM / デューティー {LIM_DUTY} /
+  Kp {LIM_KP} / Kd {LIM_KD} / トルク {LIM_TORQUE} N·m
+  ※ x はソフト停止です。本当の非常停止は電源を切ること。
 """
 
 
@@ -222,6 +256,19 @@ class Console:
                     self.target = integer(1, self.target)
                     print(f"  操作対象を ID={self.target} にしました")
 
+                elif c == "model":
+                    if len(p) > 1:
+                        name = p[1]
+                        if name not in cm.MODELS:
+                            print(f"  未知のモデル {name}。"
+                                  f"選べるのは {list(cm.MODELS)}")
+                            continue
+                        set_model(name)
+                        self.bus.model = name
+                    print(f"  モデル: {MODEL}  "
+                          f"(1 deg/s = {cm.erpm_per_deg_s(MODEL):.1f} ERPM, "
+                          f"MITトルクレンジ ±{cm.MODELS[MODEL]['t_lim']} N·m)")
+
                 elif c == "raw":
                     self.bus.raw_log = (len(p) > 1 and p[1].lower() == "on")
                     print(f"  生ログ: {'ON' if self.bus.raw_log else 'OFF'}")
@@ -307,10 +354,75 @@ class Console:
                     print("     物理的に原点へ戻すなら p 0 を使ってください。")
 
                 # ---- MIT ----
+                elif c == "mscheme":
+                    if len(p) > 1:
+                        try:
+                            cm.set_mit_scheme(p[1].lower())
+                        except ValueError as e:
+                            print(f"  {e}")
+                            continue
+                        print(f"  MIT の CAN ID 方式を {cm.MIT_SCHEME} にしました: "
+                              f"{cm.mit_scheme_desc()}")
+                    else:
+                        print(f"  現在: {cm.MIT_SCHEME} = {cm.mit_scheme_desc()}")
+                    for k in cm.MIT_SCHEMES:
+                        mark = "→" if k == cm.MIT_SCHEME else "  "
+                        print(f"   {mark} {k:6s} 送信ID 0x{cm.mit_arbitration_id(mid, k):X}"
+                              f"  {cm.MIT_SCHEMES[k][2]}")
+
+                elif c == "mprobe":
+                    sec = num(1, 1.0)
+                    print(f"  MIT の CAN ID 方式を総当たりします"
+                          f"（{len(cm.MIT_SCHEMES)}方式 × 約{sec * 2 + 0.4:.1f}秒）")
+                    print("  ⚠ enable フレームを送ります。軸は動きませんが、"
+                          "念のため脚は外すか固定した状態で実行してください。")
+                    res = self.bus.probe_mit(mid, settle=sec)
+                    print("\n  --- 結果 ---")
+                    hit = False
+                    for r in res:
+                        print(f"  [{r['scheme']}] 送信 {r['frame']}")
+                        print(f"      サーボ形式(0x29xx)の受信: "
+                              f"{r['servo_before']} → {r['servo_after']} フレーム")
+                        if r.get("echoes"):
+                            print(f"      （自分の送信エコー {r['echoes']} 件を除外済み）")
+                        if r["new_ids"]:
+                            hit = True
+                            print("      ★ 新しい CAN ID が出現: "
+                                  + ", ".join(f"0x{a:08X}" for a in r["new_ids"]))
+                            for a in r["new_ids"]:
+                                e = r["after"][a]
+                                print(f"         0x{a:08X} DLC={e['dlc']} "
+                                      f"data={e['last'].hex(' ')}")
+                        else:
+                            print("      新しい CAN ID なし")
+                        if r["servo_before"] and r["servo_after"] == 0:
+                            hit = True
+                            print("      ★ サーボ形式の定期フィードバックが止まった")
+                    print("\n  判定の目安:")
+                    print("   ・MIT に切り替わったなら、サーボ形式の受信が止まるか"
+                          "新しい CAN ID が現れるはず")
+                    print("   ・自分が送ったフレームのエコーは除外している。"
+                          "2026-09-07 にこれで誤判定した実績があるため")
+                    if hit:
+                        print("   ・★ の付いた方式が本命。mscheme で選んでから me → mrx on "
+                              "→ raw on で中身を確認してください")
+                    else:
+                        print("   ・どれも無反応。3方式とも効いていないので、上位機ソフト側で"
+                              "MIT モードに設定する必要がある可能性が高いです")
+
+                elif c == "mrx":
+                    self.bus.mit_rx = (len(p) > 1 and p[1].lower() == "on")
+                    print(f"  MIT応答の解釈: {'ON' if self.bus.mit_rx else 'OFF'}")
+                    if self.bus.mit_rx:
+                        print("  ※ サーボ形式でない8バイトフレームを MIT 応答とみなします。"
+                              "誤解釈しうるので調査中だけ ON にしてください。")
+
                 elif c == "me":
-                    self.bus.send(cm.f_mit_enable(mid), quiet=False)
+                    self.bus.mit_enable(mid, quiet=False)
+                    print(f"  方式 {cm.MIT_SCHEME} ({cm.mit_scheme_desc()}) で送信しました")
+                    print("  ※ 反応が無ければ mscheme で方式を変えるか mprobe を実行")
                 elif c == "md":
-                    self.bus.send(cm.f_mit_disable(mid), quiet=False)
+                    self.bus.mit_disable(mid, quiet=False)
                 elif c == "mz":
                     self.bus.send(cm.f_mit_set_zero(mid), quiet=False)
                 elif c == "mit":
@@ -331,9 +443,32 @@ class Console:
                     data = bytes(int(x, 16) for x in p[2:])
                     self.bus.send(cm.Frame(arb, data, True), quiet=False)
 
+                elif c == "hz":
+                    sec = num(1, 2.0)
+                    print(f"  {sec:.1f} 秒間、受信フレームを数えます…")
+                    rows = self.bus.feedback_hz(seconds=sec)
+                    if not rows:
+                        print("  1フレームも受信していません。"
+                              "電源・配線・定期フィードバック設定を確認してください。")
+                        continue
+                    for arb, m_id, n, hz, dlc, ext, last in rows:
+                        print(f"  ID=0x{arb:08X} (モーターID={m_id})  {n:5d}フレーム  "
+                              f"{hz:6.1f} Hz  DLC={dlc}  "
+                              f"{'拡張' if ext else '標準'}  最後={last.hex(' ')}")
+                    total = sum(r[3] for r in rows)
+                    print(f"  合計 {total:.1f} フレーム/秒")
+                    print(f"  ※ 制御周期はこのレートを超えても意味が薄い。"
+                          f"10モーターなら単純計算で {total * 10:.0f} フレーム/秒 "
+                          f"（1Mbps・拡張ID8バイトで約 {total * 10 * 128 / 10000:.1f}% の帯域）")
+
                 elif c == "x":
+                    had_mit = sorted(self.bus.mit_enabled)
                     ids = self.bus.stop_all()
-                    print(f"  非常停止: {ids} へ速度0を送信")
+                    msg = f"  停止: {ids} へ速度0"
+                    if had_mit:
+                        msg += f" / {had_mit} へ零トルクMIT + disable"
+                    print(msg)
+                    print("  ※ これはソフト停止です。本当の非常停止は電源を切ること。")
 
                 else:
                     print("  不明なコマンド。? でヘルプ")
