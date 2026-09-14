@@ -3,6 +3,36 @@ import sys
 import time
 import threading
 
+MOTOR_TYPE = "AK10-9"
+MIT_CONTROL_MODE = 8
+
+PARAM_RANGES = {
+    "AK10-9": {
+        "P_MIN": -12.56,
+        "P_MAX": 12.56,
+        "V_MIN": -28.0,
+        "V_MAX": 28.0,
+        "T_MIN": -54.0,
+        "T_MAX": 54.0,
+        "KP_MIN": 0.0,
+        "KP_MAX": 500.0,
+        "KD_MIN": 0.0,
+        "KD_MAX": 5.0,
+    },
+    "AK80-9": {
+        "P_MIN": -12.56,
+        "P_MAX": 12.56,
+        "V_MIN": -65.0,
+        "V_MAX": 65.0,
+        "T_MIN": -18.0,
+        "T_MAX": 18.0,
+        "KP_MIN": 0.0,
+        "KP_MAX": 500.0,
+        "KD_MIN": 0.0,
+        "KD_MAX": 5.0,
+    },
+}
+
 def float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     """浮動小数点数を指定ビット数の符号なし整数へ線形変換 (マニュアル45ページ)"""
     span = x_max - x_min
@@ -14,49 +44,53 @@ def float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     # Pythonでの丸め誤差を防ぐため以下のように計算
     return int(((x - x_min) / span) * ((1 << bits) - 1))
 
-def inputMITData(motor_type: str = "AK10-9"):
-    # モーター毎のパラメータ範囲 (マニュアル42ページ)
-    # ※ 使用するモーターに合わせて変更してください
-    PARAM_RANGES = {
-        "AK10-9": {
-            "P_MIN": -12.56,
-            "P_MAX": 12.56,
-            "V_MIN": -28.0,
-            "V_MAX": 28.0,
-            "T_MIN": -54.0,
-            "T_MAX": 54.0,
-            "KP_MIN": 0.0,
-            "KP_MAX": 500.0,
-            "KD_MIN": 0.0,
-            "KD_MAX": 5.0,
-        },
-        "AK80-9": {
-            "P_MIN": -12.56,
-            "P_MAX": 12.56,
-            "V_MIN": -65.0,
-            "V_MAX": 65.0,
-            "T_MIN": -18.0,
-            "T_MAX": 18.0,
-            "KP_MIN": 0.0,
-            "KP_MAX": 500.0,
-            "KD_MIN": 0.0,
-            "KD_MAX": 5.0,
-        },
-        "AK60-6": {
-            "P_MIN": -12.56,
-            "P_MAX": 12.56,
-            "V_MIN": -60.0,
-            "V_MAX": 60.0,
-            "T_MIN": -12.0,
-            "T_MAX": 12.0,
-            "KP_MIN": 0.0,
-            "KP_MAX": 500.0,
-            "KD_MIN": 0.0,
-            "KD_MAX": 5.0,
-        },
-    }
+def createMITData(
+    kp: float,
+    kd: float,
+    position: float,
+    velocity: float,
+    torque: float,
+    motor_type: str = MOTOR_TYPE,
+):
+    if motor_type not in PARAM_RANGES:
+        raise ValueError(f"未対応のモータータイプです: {motor_type}")
 
-    params = PARAM_RANGES.get(motor_type, PARAM_RANGES["AK10-9"])
+    return packMITData(
+        kp,
+        kd,
+        position,
+        velocity,
+        torque,
+        PARAM_RANGES[motor_type],
+    )
+
+def packMITData(kp: float, kd: float, position: float, velocity: float, torque: float, params: dict):
+    # 各パラメータの整数マッピング (44~45ページ)
+    kp_int = float_to_uint(kp, params["KP_MIN"], params["KP_MAX"], 12)
+    kd_int = float_to_uint(kd, params["KD_MIN"], params["KD_MAX"], 12)
+    p_int = float_to_uint(position, params["P_MIN"], params["P_MAX"], 16)
+    v_int = float_to_uint(velocity, params["V_MIN"], params["V_MAX"], 12)
+    t_int = float_to_uint(torque, params["T_MIN"], params["T_MAX"], 12)
+
+    # CANバッファへのパッキング (44~45ページ pack_cmd の仕様)
+    data = [0] * 8
+    data[0] = (kp_int >> 4) & 0xFF  # KP high 8 bits
+    data[1] = ((kp_int & 0x0F) << 4) | (
+        (kd_int >> 8) & 0x0F
+    )  # KP Low 4 | Kd High 4
+    data[2] = kd_int & 0xFF  # Kd low 8 bits
+    data[3] = (p_int >> 8) & 0xFF  # Position high 8 bits
+    data[4] = p_int & 0xFF  # Position low 8 bits
+    data[5] = (v_int >> 4) & 0xFF  # Speed high 8 bits
+    data[6] = ((v_int & 0x0F) << 4) | (
+        (t_int >> 8) & 0x0F
+    )  # Speed low 4 | Torque high 4
+    data[7] = t_int & 0xFF  # Torque low 8 bits
+
+    return data
+
+def inputMITData(motor_type: str = MOTOR_TYPE):
+    params = PARAM_RANGES.get(motor_type, PARAM_RANGES[MOTOR_TYPE])
 
     try:
         ans0 = float(
@@ -78,33 +112,24 @@ def inputMITData(motor_type: str = "AK10-9"):
         print("エラー：有効な数値を入力してください。")
         return [0x00] * 8
 
-    # 1. 各パラメータの整数マッピング (44~45ページ)
-    kp_int = float_to_uint(
-        ans0, params["KP_MIN"], params["KP_MAX"], 12
-    )  # 12bit
-    kd_int = float_to_uint(
-        ans1, params["KD_MIN"], params["KD_MAX"], 12
-    )  # 12bit
-    p_int = float_to_uint(ans2, params["P_MIN"], params["P_MAX"], 16)  # 16bit
-    v_int = float_to_uint(ans3, params["V_MIN"], params["V_MAX"], 12)  # 12bit
-    t_int = float_to_uint(ans4, params["T_MIN"], params["T_MAX"], 12)  # 12bit
+    return createMITData(ans0, ans1, ans2, ans3, ans4, motor_type)
 
-    # 2. CANバッファへのパッキング (44~45ページ pack_cmd の仕様)
-    data = [0] * 8
-    data[0] = (kp_int >> 4) & 0xFF  # KP high 8 bits
-    data[1] = ((kp_int & 0x0F) << 4) | (
-        (kd_int >> 8) & 0x0F
-    )  # KP Low 4 | Kd High 4
-    data[2] = kd_int & 0xFF  # Kd low 8 bits
-    data[3] = (p_int >> 8) & 0xFF  # Position high 8 bits
-    data[4] = p_int & 0xFF  # Position low 8 bits
-    data[5] = (v_int >> 4) & 0xFF  # Speed high 8 bits
-    data[6] = ((v_int & 0x0F) << 4) | (
-        (t_int >> 8) & 0x0F
-    )  # Speed low 4 | Torque high 4
-    data[7] = t_int & 0xFF  # Torque low 8 bits
+def sendMITCommand(
+    bus,
+    motor_id: int,
+    kp: float,
+    kd: float,
+    position: float,
+    velocity: float,
+    torque: float,
+    motor_type: str = MOTOR_TYPE,
+):
+    if not 0 <= motor_id < 0x100:
+        raise ValueError("motor_idは0x00から0xFFの範囲で指定してください")
 
-    return data
+    arbitration_id = 0x100 * MIT_CONTROL_MODE + motor_id
+    data = createMITData(kp, kd, position, velocity, torque, motor_type)
+    send2Motor(bus, arbitration_id, data)
 
 def main():
     # USB2CANのCAN0へ接続
@@ -119,12 +144,12 @@ def main():
 
     # モーターへ命令を送信
     try:
-        print("※終了したい場合はCtrl+Cなどで強制終了すること。\n※各質問に「h」と入力すると、説明が表示されます。")
+        print("※終了したい場合はCtrl+Cなどで強制終了すること。")
 
         while True:
 
-            controlMode, arbitration_id = inputId()
-            data = inputMITData(controlMode)
+            arbitration_id = inputId()
+            data = inputMITData()
 
             send2Motor(bus0, arbitration_id, data)
             time.sleep(1)
@@ -231,7 +256,6 @@ def receiveMotor(bus):
 def inputId():
     # 使用する変数
     motorId = 0
-    controlMode = 8
 
     # 操作するモーターの指定
     while True:
@@ -247,9 +271,9 @@ def inputId():
         else:
             print("エラー：対応する数値以外が入力されました。")
 
-    arbitration_id = 0x100 * controlMode + motorId
+    arbitration_id = 0x100 * MIT_CONTROL_MODE + motorId
 
-    return controlMode, arbitration_id
+    return arbitration_id
 
 if __name__ == "__main__":
     main()

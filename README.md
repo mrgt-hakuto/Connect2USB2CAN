@@ -21,7 +21,43 @@ pip install -r requirement.txt
 ## 3.1 サンプルプログラム
 「sample.py」の`main`関数内を適切に書き換えたうえで、実行すればモーターが回転する。
 
-## 3.2 コードの解説
+## 3.2 MITモードをコードから実行する
+`MITMode.py`の`MOTOR_TYPE`を使用するモーターに合わせて設定し、`sendMITCommand`へ制御値を指定する。
+
+```python
+from MITMode import connect2USB2CAN, sendMITCommand
+
+bus = connect2USB2CAN(channel=0)
+try:
+	sendMITCommand(
+		bus,
+		motor_id=0x01,
+		kp=20.0,
+		kd=1.0,
+		position=0.0,
+		velocity=0.0,
+		torque=0.0,
+	)
+finally:
+	if bus is not None:
+		bus.shutdown()
+```
+
+CAN接続なしで送信データだけを作る場合は、`createMITData`を使用する。
+
+```python
+from MITMode import createMITData
+
+data = createMITData(
+	kp=20.0,
+	kd=1.0,
+	position=0.0,
+	velocity=0.0,
+	torque=0.0,
+)
+```
+
+## 3.3 コードの解説
 1. `connect2USB2CAN`関数でUSB2CANへ接続する。引数は接続するCANの番号。
 2. 1.の戻り値をbusとし、arbitration_id、dataを適切に設定の上、send2Morter関数を実行すると、モーターへ指定したデータを送信することができる。
 3. 最後には必ずバスを閉じること。(例:`bus.shutdown()`)
