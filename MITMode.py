@@ -89,30 +89,30 @@ def packMITData(kp: float, kd: float, position: float, velocity: float, torque: 
 
     return data
 
-def inputMITData(motor_type: str = MOTOR_TYPE):
+def inputMITParameters(motor_type: str = MOTOR_TYPE):
     params = PARAM_RANGES.get(motor_type, PARAM_RANGES[MOTOR_TYPE])
 
     try:
-        ans0 = float(
+        kp = float(
             input(f"Kp(比例ゲイン) ({params['KP_MIN']}~{params['KP_MAX']}): ")
         )
-        ans1 = float(
+        kd = float(
             input(f"Kd(微分ゲイン) ({params['KD_MIN']}~{params['KD_MAX']}): ")
         )
-        ans2 = float(
+        position = float(
             input(f"目標位置(rad) ({params['P_MIN']}~{params['P_MAX']}): ")
         )
-        ans3 = float(
+        velocity = float(
             input(f"目標速度(rad/s) ({params['V_MIN']}~{params['V_MAX']}): ")
         )
-        ans4 = float(
+        torque = float(
             input(f"目標トルク(N*m) ({params['T_MIN']}~{params['T_MAX']}): ")
         )
     except ValueError:
         print("エラー：有効な数値を入力してください。")
-        return [0x00] * 8
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    return createMITData(ans0, ans1, ans2, ans3, ans4, motor_type)
+    return kp, kd, position, velocity, torque
 
 def sendMITCommand(
     bus,
@@ -148,10 +148,18 @@ def main():
 
         while True:
 
-            arbitration_id = inputId()
-            data = inputMITData()
+            motor_id = inputId()
+            kp, kd, position, velocity, torque = inputMITParameters()
 
-            send2Motor(bus0, arbitration_id, data)
+            sendMITCommand(
+                bus0,
+                motor_id,
+                kp,
+                kd,
+                position,
+                velocity,
+                torque,
+            )
             time.sleep(1)
 
     finally:
@@ -252,7 +260,7 @@ def receiveMotor(bus):
     except Exception as e:
         print(f"予期せぬエラーが発生しました: {e}")
 
-# arbitration_idを読み取る関数
+# モーターのIDを読み取る関数
 def inputId():
     # 使用する変数
     motorId = 0
@@ -271,9 +279,7 @@ def inputId():
         else:
             print("エラー：対応する数値以外が入力されました。")
 
-    arbitration_id = 0x100 * MIT_CONTROL_MODE + motorId
-
-    return arbitration_id
+    return motorId
 
 if __name__ == "__main__":
     main()
