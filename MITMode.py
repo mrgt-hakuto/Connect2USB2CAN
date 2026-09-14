@@ -238,7 +238,7 @@ def inputId():
         ans = input("操作するモーターのID：")
 
         if is_int(ans):  # isdigit から変更
-            motorId = int(ans)
+            motorId = int(ans, 16)
             if 0 <= motorId < 256:
                 break
 
