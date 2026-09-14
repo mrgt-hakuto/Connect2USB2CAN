@@ -140,9 +140,16 @@ def f_pos_spd(motor_id, deg, erpm, accel_erpm_s2):
 MIT_SCHEMES = {
     #  名前   : (IDベース, 拡張29bitか, 説明)
     "std":   (0x000, False, "標準11bit, ID = モーターID"),
-    "ext":   (0x800, True,  "拡張29bit, ID = 0x800 + モーターID"),
+    "ext":   (0x800, True,  "拡張29bit, ID = 0x800 + モーターID ⚠バスが落ちる"),
     "extid": (0x000, True,  "拡張29bit, ID = モーターID"),
 }
+
+# ⚠ ext は 2026-09-07 の実測で「送信するとCANバスが落ちる」と判明した。
+#   送信エコーが12件（他方式は1件）＝ ACK が返らず再送を繰り返している。
+#   その結果 error-passive/bus-off に落ち、送受信とも止まる。
+#   「サーボの定期フィードバックが 50→0 になる」のはMITに切り替わったのではなく
+#   こちらのコントローラが死んでいるだけ。既定の総当たりからは外す。
+PROBE_SCHEMES_DEFAULT = ["std", "extid"]
 MIT_SCHEME = "std"           # 現在の方式。未確定なので既定は従来どおり std
 
 
@@ -326,7 +333,13 @@ class MotorBus:
         self.tx_count = 0
         self.rx_count = 0
         self.mit_rx = False        # True で未知フレームを MIT 応答として解釈する
+        self.echo_window = 0.08    # 送信からこの秒数以内の同一フレームはエコーとみなす
+        self.echo_count = 0        # 除外したエコーの数
+        self.show_echo = False     # True なら raw ログにエコーも [TX-echo] として出す
+        self._tx_recent = []       # [(時刻, ID, データ)] 自分が送ったフレーム
         self.mit_enabled = set()   # MIT enable を送った相手（停止時に disable する）
+        self.mit_reply_ids = set() # MIT応答が実際に届いた CAN ID（A10の実測用）
+        self.rx_error = None       # 受信スレッドが止まった理由。None なら正常
         self._cap = None           # capture() 実行中だけ dict になる
 
     # ---- 接続 ----
@@ -360,12 +373,65 @@ class MotorBus:
         self.close()
 
     # ---- 受信 ----
+    def _is_echo(self, msg):
+        """
+        自分が送ったフレームが受信側に返ってきたものかを判定する。
+
+        ⚠ これが要る理由（2026-09-07 実測）:
+        gs_usb アダプタは送信フレームを受信ストリームにも流す。これを
+        モーターからの応答と取り違えると「新しい CAN ID が現れた＝MITが
+        有効になった」という誤判定になる。実際に probe_mit が
+        `0x082B DATA=FF..FC`（自分が送った enable そのもの）を新規IDとして
+        報告し、ext 方式が本命だと誤って結論づけた。
+        """
+        if getattr(msg, "is_rx", True) is False:
+            return True
+        now = time.time()
+        data = bytes(msg.data)
+        with self._lock:
+            self._tx_recent = [e for e in self._tx_recent
+                               if now - e[0] < self.echo_window]
+            for _t, arb, d in self._tx_recent:
+                if arb == msg.arbitration_id and d == data:
+                    return True
+        return False
+
+    def _looks_like_mit(self, msg):
+        """
+        MIT応答らしいフレームだけを parse_mit_reply に通す。
+
+        ⚠ これが要る理由: parse_mit_reply は「8バイト未満でなければ何でも」
+        解釈してしまう。フィルタが無いと、バス上の無関係なフレームが
+        data[0] を勝手にモーターIDとして状態表に書き込む。エラーは出ない。
+        10モーターになったら幽霊IDが増えるだけで気づけない。
+        """
+        d = msg.data
+        if d is None or len(d) < 6:
+            return False
+        if (msg.arbitration_id >> 8) == STATUS_PACKET:
+            return False          # サーボ定期フィードバックの短いやつ
+        mid = d[0]
+        if self.mit_enabled:
+            return mid in self.mit_enabled
+        return 1 <= mid <= 127
+
     def _rx_loop(self):
         while not self._stop.is_set():
             try:
                 msg = self.bus.recv(timeout=0.1)
                 if msg is None:
                     continue
+                if self._is_echo(msg):
+                    self.echo_count += 1
+                    if self.show_echo and (self.raw_log or self.on_raw):
+                        line = (f"[TX-echo] ID=0x{msg.arbitration_id:08X} "
+                                f"DLC={msg.dlc} DATA={msg.data.hex(' ')}")
+                        if self.on_raw:
+                            self.on_raw(line, msg)
+                        elif self.raw_log:
+                            print(line)
+                    continue
+
                 self.rx_count += 1
                 if self._cap is not None:
                     with self._lock:
@@ -385,8 +451,10 @@ class MotorBus:
                         print(line)
 
                 st = parse_status(msg)
-                if st is None and self.mit_rx:
+                if st is None and self.mit_rx and self._looks_like_mit(msg):
                     st = parse_mit_reply(msg, self.model)
+                    if st is not None:
+                        self.mit_reply_ids.add(msg.arbitration_id)
                 if st is None:
                     continue
                 with self._lock:
@@ -395,9 +463,13 @@ class MotorBus:
                     s.pos, s.spd, s.cur = st["pos"], st["spd"], st["cur"]
                     s.temp, s.err, s.src = st["temp"], st["err"], st["src"]
                     s.t = time.time()
-            except can.CanError:
+            except can.CanError as e:
+                self.rx_error = "CanError: %s" % e
                 break
-            except Exception:
+            except Exception as e:
+                # ここで黙って break すると「応答は来ているのに状態が更新
+                # されない」という原因不明の症状になる。理由を残す。
+                self.rx_error = "%s: %s" % (type(e).__name__, e)
                 break
 
     # ---- 状態 ----
@@ -426,6 +498,11 @@ class MotorBus:
         try:
             self.bus.send(frame.to_message())
             self.tx_count += 1
+            with self._lock:
+                self._tx_recent.append(
+                    (time.time(), frame.arbitration_id, bytes(frame.data)))
+                if len(self._tx_recent) > 200:
+                    del self._tx_recent[:100]
             if not quiet:
                 print(f"  送信 {frame}")
             return True
@@ -518,7 +595,7 @@ class MotorBus:
             return sum(e["n"] for a, e in cap.items()
                        if (a >> 8) == STATUS_PACKET)
 
-        names = list(schemes) if schemes else list(MIT_SCHEMES.keys())
+        names = list(schemes) if schemes else list(PROBE_SCHEMES_DEFAULT)
         original = MIT_SCHEME
         results = []
         try:
@@ -526,9 +603,11 @@ class MotorBus:
                 set_mit_scheme(name)
                 frame = f_mit_enable(motor_id)
                 before = self.capture(settle)
+                e0 = self.echo_count
                 self.send(frame)
                 time.sleep(0.2)
                 after = self.capture(settle)
+                echoes = self.echo_count - e0
                 self.send(f_mit_disable(motor_id))
                 time.sleep(0.2)
                 results.append({
@@ -539,6 +618,7 @@ class MotorBus:
                     "new_ids": sorted(set(after) - set(before)),
                     "servo_before": servo_count(before),
                     "servo_after": servo_count(after),
+                    "echoes": echoes,
                 })
         finally:
             set_mit_scheme(original)

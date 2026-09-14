@@ -13,7 +13,7 @@ def is_int(s):
 
 def main():
     # USB2CANのCAN0へ接続
-    bus0 = connect2USB2CAN(channel = 0)
+    bus0 = connect2USB2CAN(channel = 1)
     if bus0 is None:
         print("CANバスの接続に失敗したため、処理を中断します。")
         sys.exit()

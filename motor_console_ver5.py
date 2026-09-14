@@ -88,7 +88,9 @@ HELP = f"""
 MITモード（CAN ID 方式は未確定。まず mprobe で当たりを付ける）
   mscheme               今の方式と、3方式それぞれの送信IDを表示（何も送らない）
   mscheme ext           方式を ext に切り替え（拡張29bit・ID=0x82B）
-  mprobe 1              3方式を各1秒で総当たり（enable を送る。軸は動かない）
+  mprobe 1              MITのCAN ID方式を総当たり（enable を送る。軸は動かない）
+                        既定は std と extid のみ。ext はバスを落とすので除外
+  mprobe 1 all          ext も含めて試す ⚠バスが落ちて再起動が要る
   mrx on                未知フレームをMIT応答として解釈（戻すのは mrx off）
   me                    enable（MIT で動かす前に必要）
   md                    disable
@@ -124,11 +126,22 @@ class Console:
     def fmt(self, s):
         if s is None:
             return "  状態なし（フィードバック未受信）"
+        warn = ""
+        if getattr(self.bus, "rx_error", None):
+            warn = f"  ⚠受信スレッド停止: {self.bus.rx_error}"
+        if s.src == "mit":
+            # ⚠ MIT応答は単位がサーボと違う。rad / rad/s / N*m。
+            #   deg のつもりで読むと 1.57 を「1.6度しか動いていない」と
+            #   誤読する（実際は90度）。
+            return (f"  ID={s.id:3d}  pos={s.pos:8.4f} rad ({s.pos*57.2958:7.1f} deg)  "
+                    f"spd={s.spd:7.2f} rad/s  "
+                    f"T={s.cur:6.2f} N*m  temp={s.temp if s.temp is not None else -1:3d} C  "
+                    f"err={s.err}  [MIT]  ({s.age()*1000:.0f}ms前){warn}")
         degs = cm.erpm_to_deg_s(s.spd, MODEL)
         return (f"  ID={s.id:3d}  pos={s.pos:8.1f} deg  "
                 f"spd={s.spd:8.0f} ERPM ({degs:7.1f} deg/s)  "
-                f"cur={s.cur:6.2f} A  temp={s.temp:3d} C  err={s.err}  "
-                f"({s.age()*1000:.0f}ms前)")
+                f"cur={s.cur:6.2f} A  temp={s.temp:3d} C  err={s.err}  [servo]  "
+                f"({s.age()*1000:.0f}ms前){warn}")
 
     def show(self):
         print(self.fmt(self.bus.state(self.target)))
@@ -372,11 +385,22 @@ class Console:
 
                 elif c == "mprobe":
                     sec = num(1, 1.0)
+                    want_all = any(a.lower() == "all" for a in p[1:])
+                    schemes = (list(cm.MIT_SCHEMES) if want_all
+                               else list(cm.PROBE_SCHEMES_DEFAULT))
                     print(f"  MIT の CAN ID 方式を総当たりします"
-                          f"（{len(cm.MIT_SCHEMES)}方式 × 約{sec * 2 + 0.4:.1f}秒）")
+                          f"（{len(schemes)}方式 × 約{sec * 2 + 0.4:.1f}秒）: "
+                          f"{', '.join(schemes)}")
+                    if want_all:
+                        print("  ⚠ ext を含めています。送信するとCANバスが落ちて"
+                              "再起動が必要になります。")
+                    else:
+                        print("  ※ ext は除外しています"
+                              "（送信するとバスが落ちると実測で判明）。"
+                              "含めるなら mprobe 1 all")
                     print("  ⚠ enable フレームを送ります。軸は動きませんが、"
                           "念のため脚は外すか固定した状態で実行してください。")
-                    res = self.bus.probe_mit(mid, settle=sec)
+                    res = self.bus.probe_mit(mid, schemes=schemes, settle=sec)
                     print("\n  --- 結果 ---")
                     hit = False
                     for r in res:
@@ -396,8 +420,14 @@ class Console:
                         else:
                             print("      新しい CAN ID なし")
                         if r["servo_before"] and r["servo_after"] == 0:
-                            hit = True
-                            print("      ★ サーボ形式の定期フィードバックが止まった")
+                            if r["scheme"] == "ext":
+                                print("      ▲ サーボ形式が止まったが、これは"
+                                      "MIT有効化ではなくバスが落ちた結果"
+                                      "（エコー多数＝ACKなしで再送）")
+                            else:
+                                hit = True
+                                print("      ★ サーボ形式の定期フィードバックが"
+                                      "止まった")
                     print("\n  判定の目安:")
                     print("   ・MIT に切り替わったなら、サーボ形式の受信が止まるか"
                           "新しい CAN ID が現れるはず")
