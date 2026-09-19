@@ -151,8 +151,13 @@ def run_live(args):
     log_dir = os.path.join("logs", "dual_v8_2_" + time.strftime("%Y%m%d"))
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, "dual_" + time.strftime("%H%M%S") + ".csv")
+    opened = False
     try:
-        bus.open()
+        try:
+            bus.open()
+        except Exception as exc:
+            raise SafetyAbort(f"USB2CAN を開けません（CAN送信なし）: {exc}") from exc
+        opened = True
         time.sleep(0.5)
         initial = wait_for_feedback(bus)
         start_pos = {mid: s.pos for mid, s in initial.items()}
@@ -179,11 +184,14 @@ def run_live(args):
                 next_send = t0 + tick * period
             print(f"完了: {tick} 周期、最大送信skew={max_skew:.3f} ms、記録={path}")
     finally:
-        try:
-            send_zero(bus)
-            print(f"零MIT指令を両方へ {ZERO_CYCLES} 周期送信しました")
-        finally:
-            bus.close(stop_motors=False)
+        # open() に失敗した場合は bus.bus が None であり、送信もcloseも行わない。
+        # ここでの零指令は「実際に開けたCANへ」だけ送る。
+        if opened:
+            try:
+                send_zero(bus)
+                print(f"零MIT指令を両方へ {ZERO_CYCLES} 周期送信しました")
+            finally:
+                bus.close(stop_motors=False)
 
 
 def main():
