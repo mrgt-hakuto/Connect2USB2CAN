@@ -22,6 +22,38 @@ class FakePolicy:
         return integration.PolicyOutput(action, integration.target_from_action(action))
 
 
+class FakeT265:
+    def __init__(self, sample):
+        self.sample = sample
+        self.started = self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def latest(self):
+        return self.sample
+
+    def close(self):
+        self.closed = True
+
+
+class FakeCan:
+    tx_count = 0
+
+    def __init__(self, motors):
+        self.motors = motors
+        self.started = self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def latest(self, ids):
+        return {can_id: self.motors[can_id] for can_id in ids}
+
+    def close(self):
+        self.closed = True
+
+
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         now = 10.0
@@ -56,6 +88,32 @@ class IntegrationTests(unittest.TestCase):
         np.testing.assert_allclose(angular, np.array([0.0, 0.0, -1.0]))
         np.testing.assert_allclose(velocity, np.array([0.0, 0.2, 0.0]))
         np.testing.assert_allclose(gravity, np.array([0.0, 0.0, -1.0]))
+
+    def test_live_dry_combines_both_channels_without_transmit(self):
+        left = FakeCan(self.motors)
+        right = FakeCan(self.motors)
+        t265 = FakeT265(self.t265)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "live_dry.csv"
+            summary = integration.run_live_dry(
+                FakePolicy(), t265, left, right,
+                integration.FixedCommandSource(0.0, 0.0, 0.0), 0.05, output,
+            )
+            self.assertGreaterEqual(summary["ticks"], 3)
+            self.assertEqual(summary["can_tx_count"], 0)
+            self.assertTrue(t265.started and t265.closed)
+            self.assertTrue(left.started and left.closed)
+            self.assertTrue(right.started and right.closed)
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), summary["ticks"])
+            self.assertTrue(all(row["can_id_0"] == "0x13" for row in rows))
+            self.assertTrue(all(row["can_id_9"] == "0x2B" for row in rows))
+
+    def test_live_dry_source_has_no_can_transmit_call(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(".send(", source)
+        self.assertNotIn("stop_all(", source)
 
 
 if __name__ == "__main__":

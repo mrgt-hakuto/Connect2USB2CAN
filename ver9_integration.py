@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""D8's hardware-free 50 Hz integration of H into ver9.
+"""D8's send-free 50 Hz integration of H into ver9.
 
 The module consumes D3 base-frame values and D4/D7 feedback in H order,
 builds H's 42-element observation, evaluates the verified ONNX policy, and
-creates an ordered ten-joint CAN plan.  It intentionally does not open CAN,
-T265, or controller devices and cannot transmit a motor command.  D9 owns
-the separately reviewed, suspended-robot CAN connection.
+creates an ordered ten-joint CAN plan.  ``--live-dry`` can read T265 and both
+CAN channels, but this module has no CAN-transmit path.  D9 owns the
+separately reviewed, suspended-robot CAN connection.
 """
 
 from __future__ import annotations
@@ -31,7 +31,16 @@ from policy_integration import (
     replay_golden,
     target_from_action,
 )
-from ver9_shell import MotorFeedback, T265Sample, VelocityCommand, transform_t265_world_to_base
+from ver9_shell import (
+    FixedCommandSource,
+    MotorFeedback,
+    RealCan,
+    RealT265,
+    T265_R_OFFSET_M,
+    T265Sample,
+    VelocityCommand,
+    transform_t265_world_to_base,
+)
 
 
 HZ = 50.0
@@ -41,6 +50,8 @@ H_MODELS = (
     "AK10-9", "AK10-9", "AK10-9", "AK10-9", "AK80-9",
     "AK80-9", "AK10-9", "AK10-9", "AK80-9", "AK80-9",
 )
+LEFT_CAN_IDS = (0x13, 0x1B, 0x2A, 0x12, 0x22)
+RIGHT_CAN_IDS = (0x1C, 0x11, 0x21, 0x1A, 0x2B)
 
 
 @dataclass(frozen=True)
@@ -192,23 +203,124 @@ def run_synthetic(policy: HPolicy, duration_s: float, csv_path: Path) -> dict[st
     return {"ticks": sequence, "overruns": overrun_count}
 
 
+def run_live_dry(
+    policy: PolicyEvaluator,
+    t265: RealT265,
+    left_can: RealCan,
+    right_can: RealCan,
+    command: FixedCommandSource,
+    duration_s: float,
+    csv_path: Path,
+) -> dict[str, float | int]:
+    """Read real D3/D4 inputs through the D8 policy path without sending CAN.
+
+    The caller supplies two receive-only ``RealCan`` sources: ch=0 for the
+    five left-leg IDs and ch=1 for the five right-leg IDs.  No source offered
+    to this function has a transmit method.
+    """
+    if duration_s <= 0:
+        raise ValueError("duration must be positive")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["sequence", "tick_perf_counter_s", "period_s", "overrun", "t265_age_s"]
+    fields += [f"observation_{index}" for index in range(42)]
+    fields += [f"action_{index}" for index in range(10)]
+    fields += [f"can_id_{index}" for index in range(10)]
+    fields += [f"can_target_{index}" for index in range(10)]
+    previous_tick: float | None = None
+    last_action = np.zeros(ACTION_SIZE, dtype=np.float32)
+    sequence = overrun_count = 0
+    started: list[object] = []
+    timer_resolution_changed = _set_windows_timer_resolution_1ms(True)
+    try:
+        for source in (t265, left_can, right_can):
+            source.start()
+            started.append(source)
+        warmup_deadline = time.monotonic() + 5.0
+        while t265.latest() is None:
+            if time.monotonic() >= warmup_deadline:
+                raise RuntimeError("T265 produced no pose sample within 5 seconds")
+            time.sleep(0.01)
+        next_tick = time.perf_counter()
+        end = next_tick + duration_s
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            while time.perf_counter() < end:
+                _wait_until(next_tick)
+                tick = time.perf_counter()
+                t265_sample = t265.latest()
+                if t265_sample is None:
+                    raise RuntimeError("T265 has not produced a pose sample")
+                feedback = left_can.latest(LEFT_CAN_IDS)
+                feedback.update(right_can.latest(RIGHT_CAN_IDS))
+                snapshot, observation, output, plan = evaluate_cycle(
+                    policy, t265_sample, feedback, command.sample(tick), last_action,
+                )
+                overrun = tick > next_tick + 0.001
+                overrun_count += int(overrun)
+                row: dict[str, float | int | str] = {
+                    "sequence": sequence,
+                    "tick_perf_counter_s": f"{tick:.9f}",
+                    "period_s": "" if previous_tick is None else f"{tick - previous_tick:.9f}",
+                    "overrun": int(overrun),
+                    "t265_age_s": f"{time.monotonic() - t265_sample.acquired_monotonic_s:.9f}",
+                }
+                row.update({f"observation_{index}": float(value) for index, value in enumerate(observation)})
+                row.update({f"action_{index}": float(value) for index, value in enumerate(output.action_raw)})
+                row.update({f"can_id_{index}": f"0x{target.can_id:02X}" for index, target in enumerate(plan)})
+                row.update({f"can_target_{index}": target.position_rad for index, target in enumerate(plan)})
+                writer.writerow(row)
+                previous_tick, last_action = tick, output.action_raw
+                sequence += 1
+                next_tick += PERIOD_S
+                if next_tick <= tick:
+                    next_tick = tick + PERIOD_S
+    finally:
+        for source in reversed(started):
+            source.close()
+        if timer_resolution_changed:
+            _set_windows_timer_resolution_1ms(False)
+    if left_can.tx_count or right_can.tx_count:
+        raise RuntimeError("live dry run observed CAN transmission")
+    return {"ticks": sequence, "overruns": overrun_count, "can_tx_count": 0}
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="D8 hardware-free H/ver9 integration check (never opens or sends CAN).")
+    parser = argparse.ArgumentParser(description="D8 H/ver9 integration check (never sends CAN).")
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--csv", type=Path, required=True)
+    parser.add_argument("--live-dry", action="store_true", help="read T265 and both CAN channels, but never transmit")
+    parser.add_argument("--left-can-channel", type=int, default=0)
+    parser.add_argument("--right-can-channel", type=int, default=1)
+    parser.add_argument("--can-bitrate", type=int, default=1_000_000)
+    parser.add_argument("--fixed-vx", type=float, default=0.0)
+    parser.add_argument("--fixed-vy", type=float, default=0.0)
+    parser.add_argument("--fixed-wz", type=float, default=0.0)
     args = parser.parse_args()
     try:
         action_error, action_step, target_error, target_step = replay_golden(args.package)
         policy = HPolicy(args.package)
-        summary = run_synthetic(policy, args.duration, args.csv)
+        if args.live_dry:
+            summary = run_live_dry(
+                policy,
+                RealT265(T265_R_OFFSET_M),
+                RealCan(args.left_can_channel, args.can_bitrate),
+                RealCan(args.right_can_channel, args.can_bitrate),
+                FixedCommandSource(args.fixed_vx, args.fixed_vy, args.fixed_wz),
+                args.duration,
+                args.csv,
+            )
+        else:
+            summary = run_synthetic(policy, args.duration, args.csv)
     except (OSError, ValueError, RuntimeError) as error:
         print(f"ERROR: {error}")
         return 1
     print(f"golden_action_max_abs_error={action_error:.9g} worst_step={action_step}")
     print(f"golden_target_max_abs_error={target_error:.9g} worst_step={target_step}")
     print(f"ticks={summary['ticks']} overruns={summary['overruns']} csv={args.csv}")
-    print("PASS: D8 dry loop made 42 observations, ONNX outputs, and 10 D4/D7 CAN plans; CAN was never opened.")
+    mode = "live receive-only" if args.live_dry else "synthetic"
+    print(f"PASS: D8 {mode} loop made 42 observations, ONNX outputs, and 10 D4/D7 CAN plans; CAN was never sent.")
     return 0
 
 
