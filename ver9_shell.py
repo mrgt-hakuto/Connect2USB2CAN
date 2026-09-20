@@ -25,6 +25,9 @@ HZ = 50.0
 PERIOD_S = 1.0 / HZ
 R_CB = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]], dtype=np.float64)
 G_WORLD = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+# D3 CAD result (2026-09-20): policy-base origin -> T265 tracking center.
+# Base axes are +X front, +Y left, +Z up.
+T265_R_OFFSET_M = (0.06345, 0.08900, 0.04275)
 
 
 def _triple(values: Sequence[float], name: str) -> tuple[float, float, float]:
@@ -157,9 +160,9 @@ def transform_t265_world_to_base(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Apply D3's documented T265-to-base transform.
 
-    ``base_to_tracking_center_m`` is deliberately an argument rather than a
-    guessed module constant: it must be the CAD-recorded vector from the
-    policy base origin to the T265 tracking center.
+    ``base_to_tracking_center_m`` remains an explicit argument for test
+    inputs. The production default is the D3 CAD-recorded vector
+    ``T265_R_OFFSET_M``.
     """
     rotation = np.asarray(rotation_world_from_camera, dtype=np.float64)
     velocity = np.asarray(velocity_world, dtype=np.float64)
@@ -433,7 +436,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic", action="store_true", help="hardware-free T265/CAN test sources")
     parser.add_argument("--t265", action="store_true", help="read T265 in a background thread")
     parser.add_argument("--t265-r-offset", type=float, nargs=3, metavar=("X", "Y", "Z"),
-                        help="D3 CAD vector [m]: base origin to T265 tracking center")
+                        default=T265_R_OFFSET_M,
+                        help="D3 CAD vector [m]: base origin to T265 tracking center (default: confirmed D3 vector)")
     parser.add_argument("--can-listen", action="store_true", help="read Cubemars CAN feedback; never sends")
     parser.add_argument("--can-ids", type=_parse_can_ids, default=(), help="exactly 10 CAN IDs, comma-separated")
     parser.add_argument("--can-channel", type=int, default=1)
@@ -450,8 +454,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--can-listen requires the 10 raw CAN IDs via --can-ids")
     if args.can_ids and not args.can_listen and not args.synthetic:
         parser.error("--can-ids is only meaningful with --can-listen")
-    if args.t265 and args.t265_r_offset is None:
-        parser.error("--t265 requires --t265-r-offset X Y Z; do not guess the D3 CAD vector")
     return args
 
 
