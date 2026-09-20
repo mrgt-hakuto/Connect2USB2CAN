@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 
 MODULE_PATH = Path(__file__).with_name("ver9_shell.py")
 SPEC = importlib.util.spec_from_file_location("ver9_shell", MODULE_PATH)
@@ -42,6 +44,20 @@ class Ver9ShellTests(unittest.TestCase):
     def test_fixed_command_rejects_out_of_range_value(self):
         with self.assertRaisesRegex(ValueError, r"\[-1, 1\]"):
             ver9_shell.FixedCommandSource(1.1, 0.0, 0.0)
+
+    def test_confirmed_d3_offset_is_the_default_transform_input(self):
+        np.testing.assert_array_equal(
+            ver9_shell.T265_R_OFFSET_M,
+            np.array([0.06345, 0.08900, 0.04275]),
+        )
+        velocity, angular, _gravity = ver9_shell.transform_t265_world_to_base(
+            np.eye(3),
+            np.zeros(3),
+            np.array([0.0, -1.0, 0.0]),
+            np.asarray(ver9_shell.T265_R_OFFSET_M),
+        )
+        np.testing.assert_allclose(angular, np.array([0.0, 0.0, -1.0]))
+        np.testing.assert_allclose(velocity, np.array([-0.08900, 0.06345, 0.0]))
 
     def test_no_can_transmit_symbol_in_d2_source(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
