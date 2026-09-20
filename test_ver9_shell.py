@@ -59,6 +59,11 @@ class Ver9ShellTests(unittest.TestCase):
         np.testing.assert_allclose(angular, np.array([0.0, 0.0, -1.0]))
         np.testing.assert_allclose(velocity, np.array([-0.08900, 0.06345, 0.0]))
 
+    def test_servo_feedback_units_convert_to_h_radians(self):
+        position, velocity = ver9_shell.servo_feedback_to_h_units(180.0, 31.5)
+        self.assertAlmostEqual(position, np.pi)
+        self.assertAlmostEqual(velocity, np.pi / 180.0)
+
     def test_no_can_transmit_symbol_in_d2_source(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertNotIn(".send(", source)

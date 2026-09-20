@@ -269,6 +269,11 @@ class RealT265:
             self._pipe = None
 
 
+def servo_feedback_to_h_units(position_deg: float, velocity_erpm: float) -> tuple[float, float]:
+    """Convert verified Cubemars servo feedback units to the H contract."""
+    return math.radians(float(position_deg)), math.radians(float(velocity_erpm) / 31.5)
+
+
 class RealCan:
     """Read Cubemars status frames only.  This class has no transmit method."""
 
@@ -295,7 +300,14 @@ class RealCan:
         for can_id in expected_ids:
             state = self._bus.state(can_id)
             if state is not None:
-                result[can_id] = MotorFeedback(can_id, now, float(state.pos), float(state.spd))
+                # Servo feedback is output-shaft degrees and ERPM.  H's
+                # observation contract requires radians and radians/second.
+                result[can_id] = MotorFeedback(
+                    can_id,
+                    now,
+                    math.radians(float(state.pos)),
+                    math.radians(float(state.spd) / 31.5),
+                )
         self.tx_count = int(self._bus.tx_count)
         return result
 
