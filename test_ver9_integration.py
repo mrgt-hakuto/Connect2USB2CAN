@@ -75,9 +75,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(tuple(target.model for target in plan), integration.H_MODELS)
         np.testing.assert_allclose([target.position_rad for target in plan], output.joint_target_h_order, rtol=0, atol=0)
 
+    def test_user_verified_left_right_can_mapping(self):
+        self.assertEqual(integration.H_CAN_IDS, (0x1C, 0x13, 0x11, 0x1B, 0x21, 0x2A, 0x1A, 0x12, 0x2B, 0x22))
+        self.assertEqual(integration.LEFT_CAN_IDS, (0x1C, 0x11, 0x21, 0x1A, 0x2B))
+        self.assertEqual(integration.RIGHT_CAN_IDS, (0x13, 0x1B, 0x2A, 0x12, 0x22))
+
     def test_missing_feedback_is_rejected(self):
         self.motors.pop(integration.H_CAN_IDS[3])
-        with self.assertRaisesRegex(ValueError, "0x11"):
+        with self.assertRaisesRegex(ValueError, "0x1B"):
             integration.policy_snapshot_from_inputs(self.t265, self.motors, self.command, np.zeros(10))
 
     def test_t265_offset_transform_is_applied(self):
@@ -107,8 +112,8 @@ class IntegrationTests(unittest.TestCase):
             with output.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), summary["ticks"])
-            self.assertTrue(all(row["can_id_0"] == "0x13" for row in rows))
-            self.assertTrue(all(row["can_id_9"] == "0x2B" for row in rows))
+            self.assertTrue(all(row["can_id_0"] == "0x1C" for row in rows))
+            self.assertTrue(all(row["can_id_9"] == "0x22" for row in rows))
 
     def test_live_dry_source_has_no_can_transmit_call(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
