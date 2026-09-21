@@ -39,8 +39,18 @@ def zero_frames():
 
 class DualBus:
     def __init__(self, left_channel=0, right_channel=1): self.left=cm.MotorBus(channel=left_channel); self.right=cm.MotorBus(channel=right_channel)
-    def open(self): self.left.open(); self.right.open()
-    def close(self): self.left.close(stop_motors=False); self.right.close(stop_motors=False)
+    def open(self):
+        self.left.open()
+        try:
+            self.right.open()
+        except Exception:
+            self.close()
+            raise
+    def close(self):
+        try:
+            self.left.close(stop_motors=False)
+        finally:
+            self.right.close(stop_motors=False)
     def state(self, mid): return (self.left if mid in LEFT_CAN_IDS else self.right).state(mid)
     def send(self, frame): (self.left if (frame.arbitration_id & 255) in LEFT_CAN_IDS else self.right).send(frame)
     def feedback(self):
@@ -66,8 +76,9 @@ def preview():
 
 def run(package,duration,csv_path,vx,vy,wz):
     policy=HPolicy(package); bus=DualBus(); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
-    rows=[]; bus.open(); t265.start(); deadline=time.monotonic()+5
+    rows=[]; bus_open_attempted=False; t265_start_attempted=False
     try:
+        bus_open_attempted=True; bus.open(); t265_start_attempted=True; t265.start(); deadline=time.monotonic()+5
         while t265.latest() is None:
             if time.monotonic()>deadline: raise RuntimeError("T265 warmup timeout")
             time.sleep(.01)
@@ -78,10 +89,30 @@ def run(package,duration,csv_path,vx,vy,wz):
             for fr in frames(out.joint_target_h_order): bus.send(fr)
             rows.append((tick,*out.joint_target_h_order)); last=out.action_raw; nxt+=PERIOD
     finally:
-        bus.zero(); t265.close(); bus.close()
-    csv_path.parent.mkdir(parents=True,exist_ok=True)
-    with csv_path.open('w',newline='',encoding='utf-8') as f:
-        w=csv.writer(f); w.writerow(('tick',*H_CAN_IDS)); w.writerows(rows)
+        # Cleanup must never be skipped, including a stale-feedback or USB-open
+        # failure.  Attempt all shutdown steps even if one of them fails.
+        if bus_open_attempted:
+            try:
+                bus.zero()
+            except Exception as error:
+                print(f"WARNING: zero MIT cleanup failed: {error}")
+        if t265_start_attempted:
+            try:
+                t265.close()
+            except Exception as error:
+                print(f"WARNING: T265 cleanup failed: {error}")
+        if bus_open_attempted:
+            try:
+                bus.close()
+            except Exception as error:
+                print(f"WARNING: CAN cleanup failed: {error}")
+        # Preserve evidence from a partial run without masking its primary error.
+        try:
+            csv_path.parent.mkdir(parents=True,exist_ok=True)
+            with csv_path.open('w',newline='',encoding='utf-8') as f:
+                w=csv.writer(f); w.writerow(('tick',*H_CAN_IDS)); w.writerows(rows)
+        except Exception as error:
+            print(f"WARNING: CSV cleanup failed: {error}")
 
 def main():
     p=argparse.ArgumentParser(description='D8 10-axis MIT sender; --arm is required for any CAN transmit.')
