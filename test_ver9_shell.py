@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +69,63 @@ class Ver9ShellTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertNotIn(".send(", source)
         self.assertNotIn("stop_all(", source)
+
+    def test_real_t265_releases_enumeration_context_before_pipeline_start(self):
+        lifecycle = {"context_released": False}
+
+        class Device:
+            def get_info(self, _info):
+                return "15322110478"
+
+        class Context:
+            def query_devices(self):
+                return [Device()]
+
+            def __del__(self):
+                lifecycle["context_released"] = True
+
+        class Config:
+            def enable_device(self, _serial):
+                return None
+
+            def enable_stream(self, _stream):
+                return None
+
+        class Pipeline:
+            def start(self, _config):
+                if not lifecycle["context_released"]:
+                    raise RuntimeError("No device connected")
+
+            def wait_for_frames(self, _timeout_ms):
+                raise RuntimeError("test receiver exit")
+
+            def stop(self):
+                return None
+
+        class FakeRs:
+            camera_info = type("CameraInfo", (), {"serial_number": object()})
+            stream = type("Stream", (), {"pose": object()})
+            context = Context
+            pipeline = Pipeline
+            config = Config
+
+        with patch.dict(sys.modules, {"pyrealsense2": FakeRs}):
+            source = ver9_shell.RealT265((0.0, 0.0, 0.0))
+            source.start()
+            source.close()
+        self.assertTrue(lifecycle["context_released"])
+
+    def test_real_t265_receiver_keeps_waiting_after_frame_timeout(self):
+        source = ver9_shell.RealT265((0.0, 0.0, 0.0))
+
+        class TimeoutPipe:
+            def wait_for_frames(self, _timeout_ms):
+                source._stop.set()
+                raise RuntimeError("Frame didn't arrive within 100")
+
+        source._pipe = TimeoutPipe()
+        source._receive_loop()
+        self.assertIsNone(source._error)
 
 
 if __name__ == "__main__":

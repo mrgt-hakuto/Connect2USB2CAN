@@ -204,9 +204,14 @@ class RealT265:
         if not devices:
             raise RuntimeError("T265 was not found")
         serial = devices[0].get_info(rs.camera_info.serial_number)
+        # Device enumeration owns native USB handles.  Release that context before
+        # creating a pipeline; keeping it alive makes the T265 report "No device
+        # connected" here although query_devices() succeeded.
+        del devices, ctx
         pipe = None
         last_error: Optional[Exception] = None
         for _ in range(8):
+            candidate = None
             try:
                 candidate = rs.pipeline()
                 config = rs.config()
@@ -217,6 +222,8 @@ class RealT265:
                 break
             except RuntimeError as error:
                 last_error = error
+                # Do not retain a failed native pipeline while waiting to retry.
+                candidate = None
                 time.sleep(2.0)
         if pipe is None:
             raise RuntimeError(f"T265 start failed after 8 attempts: {last_error}")
@@ -229,7 +236,12 @@ class RealT265:
         assert self._pipe is not None
         try:
             while not self._stop.is_set():
-                frames = self._pipe.wait_for_frames(100)
+                try:
+                    frames = self._pipe.wait_for_frames(100)
+                except RuntimeError:
+                    # The T265 can time out while it is warming up.  This is not
+                    # a receiver failure; t265_check.py keeps waiting here too.
+                    continue
                 pose_frame = frames.get_pose_frame()
                 if not pose_frame:
                     continue
