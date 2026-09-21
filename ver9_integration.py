@@ -41,21 +41,11 @@ from ver9_shell import (
     VelocityCommand,
     transform_t265_world_to_base,
 )
+from robot_joint_map import H_CAN_IDS, H_MODELS, LEFT_CAN_IDS, RIGHT_CAN_IDS
 
 
 HZ = 50.0
 PERIOD_S = 1.0 / HZ
-# H joint order is interleaved LL/LR by joint type.  The physical left/right
-# mapping was re-verified on 2026-09-21; the earlier mapping was reversed.
-H_CAN_IDS = (0x1C, 0x13, 0x11, 0x1B, 0x21, 0x2A, 0x1A, 0x12, 0x2B, 0x22)
-H_MODELS = (
-    "AK10-9", "AK10-9", "AK10-9", "AK10-9", "AK80-9",
-    "AK80-9", "AK10-9", "AK10-9", "AK80-9", "AK80-9",
-)
-LEFT_CAN_IDS = (0x1C, 0x11, 0x21, 0x1A, 0x2B)
-RIGHT_CAN_IDS = (0x13, 0x1B, 0x2A, 0x12, 0x22)
-
-
 @dataclass(frozen=True)
 class CanTarget:
     """One D4/D7-converted target.  Values remain in radians and H sign."""

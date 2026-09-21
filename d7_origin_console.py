@@ -11,38 +11,18 @@ import pathlib
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from typing import Dict, Optional
 
 import cubemars as cm
+from robot_joint_map import BY_ID, JOINTS, JointBinding
 
 
 BITRATE = 1_000_000
 FRESH_S = 0.3
+OPEN_SETTLE_S = 0.75
 
 
-@dataclass(frozen=True)
-class Joint:
-    name: str
-    motor_id: int
-    channel: int
-    model: str
-
-
-# D7で確認済みの配線。IDは全て16進数で扱う。
-JOINTS = (
-    Joint("LL_HR",  0x13, 0, "AK10-9"),
-    Joint("LL_HAA", 0x1B, 0, "AK10-9"),
-    Joint("LL_HFE", 0x2A, 0, "AK80-9"),
-    Joint("LL_KFE", 0x12, 0, "AK10-9"),
-    Joint("LL_FFE", 0x22, 0, "AK80-9"),
-    Joint("LR_HR",  0x1C, 1, "AK10-9"),
-    Joint("LR_HAA", 0x11, 1, "AK10-9"),
-    Joint("LR_HFE", 0x21, 1, "AK80-9"),
-    Joint("LR_KFE", 0x1A, 1, "AK10-9"),
-    Joint("LR_FFE", 0x2B, 1, "AK80-9"),
-)
-BY_ID = {joint.motor_id: joint for joint in JOINTS}
+Joint = JointBinding
 
 
 def parse_hex_motor_id(text: str) -> Optional[int]:
@@ -73,9 +53,16 @@ class D7Console:
 
     def start(self) -> None:
         for channel, bus in self.buses.items():
-            bus.open()
+            try:
+                bus.open()
+            except Exception as error:
+                self._record(f"open FAILED ch={channel}: {type(error).__name__}: {error}")
+                raise
             print(f"接続: ch={channel} {BITRATE} bps（受信開始、まだ送信なし）")
-        time.sleep(0.5)
+            self._record(f"open OK ch={channel}; USB reset settle={OPEN_SETTLE_S:.2f}s")
+            # gs_usb resets its USB interface at Bus() construction.  Let each
+            # interface settle before opening the next one; this sends no CAN.
+            time.sleep(OPEN_SETTLE_S)
         print(f"記録: {self.log_path}")
 
     def close(self) -> None:
@@ -129,6 +116,9 @@ class D7Console:
                 print(f"  0x{motor_id:02X} {label:7s} {count:3d}件 {hz:5.1f}Hz  {detail.split('  ', 1)[-1] if detail else ''}")
                 if not ok:
                     print("    <-- D7を続けない")
+            self._record("scan ch=" + str(channel) + " found=" + ",".join(
+                f"0x{motor_id:02X}" for _arb, motor_id, *_rest in rows.get(channel, [])
+            ))
         missing = sorted(set(BY_ID) - found)
         unexpected = sorted(found - set(BY_ID))
         if missing:
