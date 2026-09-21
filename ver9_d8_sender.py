@@ -38,7 +38,7 @@ def zero_frames():
     return tuple(f_mit(mid, 0., 0., 0., 0., 0., model) for mid,model in zip(H_CAN_IDS,H_MODELS))
 
 class DualBus:
-    def __init__(self): self.left=cm.MotorBus(channel=0); self.right=cm.MotorBus(channel=1)
+    def __init__(self, left_channel=0, right_channel=1): self.left=cm.MotorBus(channel=left_channel); self.right=cm.MotorBus(channel=right_channel)
     def open(self): self.left.open(); self.right.open()
     def close(self): self.left.close(stop_motors=False); self.right.close(stop_motors=False)
     def state(self, mid): return (self.left if mid in LEFT_CAN_IDS else self.right).state(mid)

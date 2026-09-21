@@ -116,10 +116,14 @@ def target_from_action(action_raw: Sequence[float] | np.ndarray) -> np.ndarray:
 class HPolicy:
     """A verified deployment package evaluated without any hardware access."""
 
-    def __init__(self, package: Path):
+    def __init__(self, package: Path, providers: list[str] | None = None):
         self.package = package.resolve()
         verify_manifest(self.package)
-        self._session, self._input_name, self._output_name = validate_session(self.package / "policy.onnx")
+        self._session, self._input_name, self._output_name = validate_session(self.package / "policy.onnx", providers)
+
+    @property
+    def providers(self) -> tuple[str, ...]:
+        return tuple(self._session.get_providers())
 
     def evaluate(self, snapshot: PolicySnapshot) -> PolicyOutput:
         observation = build_observation(snapshot)

@@ -141,9 +141,9 @@ def load_golden(package: Path) -> GoldenData:
     return GoldenData(obs_flat, action_raw, joint_target, default_joint_pos)
 
 
-def validate_session(model_path: Path) -> tuple[ort.InferenceSession, str, str]:
+def validate_session(model_path: Path, providers: list[str] | None = None) -> tuple[ort.InferenceSession, str, str]:
     try:
-        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(str(model_path), providers=providers or ["CPUExecutionProvider"])
     except Exception as exc:  # onnxruntime's exception hierarchy differs by version.
         raise DryRunError(f"could not load ONNX model: {exc}") from exc
     inputs, outputs = session.get_inputs(), session.get_outputs()
