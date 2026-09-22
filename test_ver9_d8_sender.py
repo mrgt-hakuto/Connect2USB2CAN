@@ -65,10 +65,22 @@ class TorquePathTests(unittest.TestCase):
 class ProbeAngleLimitTests(unittest.TestCase):
     """The probe angle is bounded by the current abort, per axis."""
 
-    def test_ak10_hr_limit_is_the_absolute_ceiling(self):
-        # Kp 7.937 reaches 0.95 A at 6.86 deg, so the 7.0 deg ceiling binds.
-        self.assertAlmostEqual(sender.max_probe_angle_deg(7.937), 6.859, places=2)
-        self.assertLessEqual(sender.max_probe_angle_deg(7.937), sender.STATIC_PROBE_MAX_DEG)
+    def test_ak10_hr_limit_leaves_room_for_a_feedback_noise_peak(self):
+        # Kp 7.937 commands 0.92 A at 6.64 deg; a +0.08 A noise peak on top of
+        # that still sits at the 1.0 A abort rather than through it.
+        limit = sender.max_probe_angle_deg(7.937)
+        self.assertAlmostEqual(limit, 6.641, places=2)
+        self.assertLessEqual(limit, sender.STATIC_PROBE_MAX_DEG)
+        commanded = np.deg2rad(limit) * 7.937
+        self.assertLessEqual(
+            commanded + sender.FEEDBACK_CURRENT_NOISE_A, sender.CURRENT_ABORT_A + 1e-9
+        )
+
+    def test_the_angle_limit_still_admits_the_approved_6_5_deg(self):
+        # The noise allowance tightens the angle limit.  It must not be so
+        # tight that the already-approved D9-3 angle becomes unrepresentable;
+        # refusing a repeat is the stall guard's job, not the parser's.
+        self.assertGreaterEqual(sender.max_probe_angle_deg(7.937), 6.5)
 
     def test_a_stiffer_axis_gets_a_smaller_limit(self):
         # AK80-9 at stiffness 15 commands Kp 28.7; 7 deg there would be 3.5 A.
@@ -76,14 +88,16 @@ class ProbeAngleLimitTests(unittest.TestCase):
         self.assertLess(limit, 2.0)
         self.assertAlmostEqual(
             np.deg2rad(limit) * 28.7,
-            sender.CURRENT_ABORT_A * sender.PROBE_CURRENT_HEADROOM,
+            sender.CURRENT_ABORT_A - sender.FEEDBACK_CURRENT_NOISE_A,
             places=6,
         )
 
-    def test_the_approved_d9_3_angle_passes_the_stall_guard(self):
-        ceiling, _detail = sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
-        self.assertGreater(ceiling, sender.DEMONSTRATED_STALL_CURRENT_A[0x1C])
-        self.assertAlmostEqual(ceiling, 0.900, places=2)
+    def test_d9_3_cannot_be_repeated_now_that_0x1c_held_0_86a(self):
+        # D9-3 itself raised the demonstrated stall current, so the same run
+        # can no longer produce new information and must be refused.
+        self.assertAlmostEqual(sender.DEMONSTRATED_STALL_CURRENT_A[0x1C], 0.86)
+        with self.assertRaisesRegex(RuntimeError, "repeat-probe abort"):
+            sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
 
 
 class StallGuardTests(unittest.TestCase):
@@ -150,16 +164,95 @@ class SenderCleanupTests(unittest.TestCase):
         self.assertAlmostEqual(current, 0.03)
         self.assertIn("no meaningful current", verdict)
 
-    def test_static_probe_requires_meaningful_fraction_of_requested_motion(self):
-        rows = [(0.0, "probe-hold", "0x1C", -0.04, -0.04, -0.04,
-                 np.deg2rad(-0.3), 0.0, -0.34)]
-        movement, current, required, verdict = sender.static_probe_summary(
-            rows, 0.0, np.deg2rad(-2.5)
+class ProbeScoringTests(unittest.TestCase):
+    """The static probe is scored, not aborted: standing still is a result."""
+
+    @staticmethod
+    def _rows(positions_deg, currents, stage="probe-hold"):
+        return [
+            (0.02 * index, stage, "0x1C", np.deg2rad(-6.5), np.deg2rad(-6.5),
+             np.deg2rad(-6.9), np.deg2rad(position), 0.0, -current)
+            for index, (position, current) in enumerate(zip(positions_deg, currents))
+        ]
+
+    def test_quantization_dither_is_not_breakaway(self):
+        # The measured D9-3 shape: 0.1 deg feedback increments flickering up
+        # and down, net 0.2 deg after 10 s.  Two increments are wind-up and
+        # backlash take-up, not rotation, so this is C and not B.
+        positions = [-0.4, -0.5, -0.4, -0.5, -0.6, -0.5, -0.6, -0.6]
+        result = sender.probe_result(
+            self._rows(positions, [0.87] * len(positions)),
+            np.deg2rad(-0.4), np.deg2rad(-6.5),
         )
-        self.assertAlmostEqual(np.rad2deg(movement), 0.3)
-        self.assertAlmostEqual(current, 0.34)
-        self.assertAlmostEqual(np.rad2deg(required), 1.25)
-        self.assertIn("stalled before target", verdict)
+        self.assertLess(np.rad2deg(result.net_rad), sender.BREAKAWAY_MIN_DEG)
+        self.assertEqual(result.letter, "C")
+        self.assertIsNone(result.breakaway_current_a)
+
+    def test_real_breakaway_short_of_target_is_b_and_reports_its_current(self):
+        positions = [-0.4, -0.9, -1.4, -1.9, -1.9, -1.9]
+        currents = [0.30, 0.55, 0.60, 0.62, 0.62, 0.62]
+        result = sender.probe_result(
+            self._rows(positions, currents), np.deg2rad(-0.4), np.deg2rad(-6.5)
+        )
+        self.assertEqual(result.letter, "B")
+        # The first sample past the 0.5 deg floor was reading 0.55 A.
+        self.assertAlmostEqual(result.breakaway_current_a, 0.55, places=2)
+
+    def test_covering_half_the_request_is_a(self):
+        positions = [-0.4, -2.0, -3.9, -3.9, -3.9]
+        result = sender.probe_result(
+            self._rows(positions, [0.4] * len(positions)),
+            np.deg2rad(-0.4), np.deg2rad(-6.5),
+        )
+        self.assertEqual(result.letter, "A")
+        self.assertAlmostEqual(np.rad2deg(result.required_rad), 3.25, places=2)
+
+    def test_no_current_and_no_motion_is_d_not_a_mechanical_verdict(self):
+        positions = [-0.4] * 6
+        result = sender.probe_result(
+            self._rows(positions, [0.02] * 6), np.deg2rad(-0.4), np.deg2rad(-6.5)
+        )
+        self.assertEqual(result.letter, "D")
+
+    def test_sustained_current_ignores_a_single_noise_peak(self):
+        positions = [-0.4] * 7
+        currents = [0.85, 0.87, 0.93, 0.86, 0.88, 0.84, 0.87]
+        result = sender.probe_result(
+            self._rows(positions, currents), np.deg2rad(-0.4), np.deg2rad(-6.5)
+        )
+        self.assertAlmostEqual(result.peak_current_a, 0.93, places=2)
+        self.assertAlmostEqual(result.sustained_current_a, 0.87, places=2)
+        # The deadband bound follows the sustained current, so the peak cannot
+        # inflate it: 0.87/7.937 is 6.28 deg, not 0.93/7.937 = 6.71 deg.
+        bound = sender.deadband_lower_bound_rad(result.sustained_current_a, 7.937)
+        self.assertAlmostEqual(np.rad2deg(bound), 6.28, places=1)
+
+    def test_the_ramp_stage_alone_still_scores(self):
+        positions = [-0.4, -0.4, -0.4, -0.4]
+        result = sender.probe_result(
+            self._rows(positions, [0.5] * 4, stage="probe-ramp"),
+            np.deg2rad(-0.4), np.deg2rad(-6.5),
+        )
+        self.assertEqual(result.letter, "C")
+
+    def test_an_unverified_torque_path_overrides_the_letter(self):
+        result = sender.ProbeResult(0.0, 0.0, 0.5, 0.5, 0.05, None, "C", "stalled")
+        self.assertEqual(sender.d9_3_letter(result, "MIT torque absent (...)"), "D")
+        self.assertEqual(
+            sender.d9_3_letter(result, "MIT torque path verified (...)"), "C"
+        )
+
+    def test_every_letter_has_a_next_step_and_an_exit_code(self):
+        for letter in "ABCD":
+            self.assertIn(letter, sender.D9_3_NEXT_STEP)
+            self.assertIn(letter, sender.D9_3_EXIT_CODE)
+        self.assertEqual(sender.D9_3_EXIT_CODE["A"], 0)
+        self.assertEqual(sender.D9_3_EXIT_CODE["B"], 0)
+        self.assertNotEqual(sender.D9_3_EXIT_CODE["C"], 0)
+        self.assertNotEqual(sender.D9_3_EXIT_CODE["D"], 0)
+
+
+class SenderCleanupTests2(unittest.TestCase):
 
     def test_policy_ramp_requires_meaningful_fraction_of_initial_target(self):
         rows = [(0.0, "ramp", "0x1C", -0.11, -0.11, -0.11,
@@ -216,13 +309,44 @@ class SenderCleanupTests(unittest.TestCase):
 
     def test_main_static_probe_requires_arm_and_uses_no_policy_package(self):
         argv = [
-            "ver9_d8_sender.py", "--arm", "--static-probe", "--motor-id", "0x1C",
+            # 0x13 has no recorded stall, so the repeat guard stays out of
+            # the way of what this test is about.
+            "ver9_d8_sender.py", "--arm", "--static-probe", "--motor-id", "0x13",
             "--probe-target-deg", "-2.5", "--ramp-seconds", "6", "--duration", "2",
             "--csv", "out.csv",
         ]
         with patch.object(sys, "argv", argv), patch.object(sender, "run_static_probe") as probe:
-            sender.main()
-        self.assertEqual(probe.call_args.args[1:], (0x1C, -2.5, 6.0, 2.0))
+            probe.return_value = "C"
+            exit_code = sender.main()
+        self.assertEqual(probe.call_args.args[1:], (0x13, -2.5, 6.0, 2.0))
+        # A scored, non-moving probe leaves a legible exit code, not a traceback.
+        self.assertEqual(exit_code, sender.D9_3_EXIT_CODE["C"])
+
+    def test_main_refuses_a_repeat_probe_before_opening_the_bus(self):
+        argv = [
+            "ver9_d8_sender.py", "--arm", "--static-probe", "--motor-id", "0x1C",
+            "--probe-target-deg", "-6.5", "--ramp-seconds", "8", "--duration", "2",
+            "--csv", "out.csv",
+        ]
+        with patch.object(sys, "argv", argv), \
+                patch.object(sender, "run_static_probe") as probe, \
+                patch.object(sender, "DualBus") as bus:
+            with self.assertRaises(SystemExit):
+                sender.main()
+        probe.assert_not_called()
+        bus.assert_not_called()
+
+    def test_main_static_probe_exits_zero_when_the_axis_moves(self):
+        argv = [
+            # 0x13 has no recorded stall, so the repeat guard stays out of
+            # the way of what this test is about.
+            "ver9_d8_sender.py", "--arm", "--static-probe", "--motor-id", "0x13",
+            "--probe-target-deg", "-2.5", "--ramp-seconds", "6", "--duration", "2",
+            "--csv", "out.csv",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run_static_probe") as probe:
+            probe.return_value = "B"
+            self.assertEqual(sender.main(), 0)
 
     def test_default_buses_open_both_physical_channels(self):
         bus = sender.DualBus()

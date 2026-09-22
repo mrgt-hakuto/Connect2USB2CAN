@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 import time
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 import numpy as np
 
@@ -17,7 +19,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_BREAKAWAY_20260922_2130"
+BUILD_ID = "D9_VERDICT_20260922_2015"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -44,9 +46,26 @@ STALL_CURRENT_A = 0.10
 # still at 0.66 A, which 2.5 deg (0.35 A) could never exceed.  The per-axis
 # limit below is the binding one; this is only the absolute ceiling.
 STATIC_PROBE_MAX_DEG = 7.0
-# Stay clear of the current abort, so a probe ends on its own verdict rather
-# than on a trip partway up the ramp.
-PROBE_CURRENT_HEADROOM = 0.95
+# Measured scatter of the reported |I| about Kp*error while the commanded
+# error is constant (D9-3 hold phase, 2026-09-22: command 0.87 A, samples
+# 0.79-0.93 A).  It is feedback noise, not extra torque, and it has two
+# consequences that belong here rather than in the operator's head.  A probe
+# must command far enough below CURRENT_ABORT_A that a noise peak cannot trip
+# the abort, and no physical bound may be read off a single peak sample.
+FEEDBACK_CURRENT_NOISE_A = 0.08
+# The servo position feedback is quantized to 0.1 deg, so one or two changed
+# increments are quantization dither, elastic wind-up or backlash take-up --
+# not rotation.  D9-3 measured exactly that: 0.200 deg of non-monotone dither
+# over 10 s, ending 0.2 deg from its start while 0.87 A was held.  A 0.1 deg
+# floor cannot tell that from breakaway, so breakaway now means five feedback
+# increments of *net, sustained* displacement toward the target.
+# NOTE: this moves the D9-3 table's B/C boundary after the run.  It is a
+# deliberate, documented change (reports/2026-09-22_d9-3_result.md) because
+# the old boundary sat on the measurement's own resolution, and it moves the
+# 0.200 deg result toward the more cautious action, not the convenient one.
+FEEDBACK_POSITION_LSB_DEG = 0.1
+BREAKAWAY_MIN_DEG = 0.5
+BREAKAWAY_MIN_RAD = np.deg2rad(BREAKAWAY_MIN_DEG)
 # Seeing one encoder increment is insufficient for a fixed-target probe.  It
 # must cover a meaningful portion of the requested relative displacement.
 STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
@@ -75,7 +94,12 @@ TORQUE_PATH_MIN_ERROR_RAD = np.deg2rad(0.5)
 # its target angle, so it is refused before a single MIT frame.  Raising Kp,
 # the target or the torque field to clear this guard is not permitted; the
 # mechanical load or the diagnostic itself has to change.
-DEMONSTRATED_STALL_CURRENT_A = {0x1C: 0.66}
+# Sustained current each axis has already held without breaking away.
+# 2026-09-22 D9-3 raised 0x1C from 0.66 to 0.86 A (logs/d9_3_breakaway_0x1c.csv,
+# sustained over the hold stage).  With Kp 7.937 the largest angle the current
+# abort allows is 6.64 deg, i.e. 0.92 A commanded, so this method has almost no
+# headroom left and a repeat of the 6.5 deg run is now refused before any send.
+DEMONSTRATED_STALL_CURRENT_A = {0x1C: 0.86}
 STALL_GUARD_MARGIN_A = 0.05
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
@@ -146,16 +170,85 @@ def tracking_summary(rows, initial_position_rad):
     return max_movement, max_current, verdict
 
 
-def static_probe_summary(rows, initial_position_rad, target_delta_rad):
-    """Require a static probe to cover half of its requested displacement."""
-    movement, current, verdict = tracking_summary(rows, initial_position_rad)
-    required = max(MIN_TRACKING_RAD, abs(target_delta_rad) * STATIC_PROBE_MIN_TRACKING_FRACTION)
-    if movement < required:
-        if current >= STALL_CURRENT_A:
-            verdict = "position stalled before target (current present; static friction/mechanical load suspected)"
-        else:
-            verdict = "no meaningful position response before target (MIT torque response unproven)"
-    return movement, current, required, verdict
+class ProbeResult(NamedTuple):
+    """One static probe, scored.  Not moving is a result, never an error."""
+
+    net_rad: float
+    excursion_rad: float
+    sustained_current_a: float
+    peak_current_a: float
+    required_rad: float
+    breakaway_current_a: Optional[float]
+    letter: str
+    verdict: str
+
+
+def held_rows(rows):
+    """The samples taken at the commanded target: hold stage, else last half."""
+    hold = [row for row in rows if row[1].endswith("hold")]
+    if hold:
+        return hold
+    return rows[len(rows) // 2:] or list(rows)
+
+
+def median(values):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return float((ordered[middle - 1] + ordered[middle]) / 2.0)
+
+
+def sustained_current_a(rows):
+    """|I| the axis actually held, robust to a single noisy feedback sample."""
+    return median([abs(row[8]) for row in held_rows(rows)])
+
+
+def breakaway_current_a(rows, initial_position_rad, target_delta_rad):
+    """|I| at the first sample past the quantization/wind-up band, if any."""
+    sign = 1.0 if target_delta_rad >= 0 else -1.0
+    for row in rows:
+        if sign * (row[6] - initial_position_rad) >= BREAKAWAY_MIN_RAD:
+            return abs(row[8])
+    return None
+
+
+def probe_result(rows, initial_position_rad, target_delta_rad):
+    """Score one static probe against the D9-3 table, without raising.
+
+    Displacement is the *net, sustained* motion toward the requested target,
+    not the largest excursion: a feedback increment flickering up and down is
+    not rotation, and the probe exists to measure breakaway, so an axis that
+    stays put is a measurement rather than a failure of the run.
+    """
+    if not rows:
+        return ProbeResult(0.0, 0.0, 0.0, 0.0, 0.0, None, "D",
+                           "no selected-axis feedback samples")
+    sign = 1.0 if target_delta_rad >= 0 else -1.0
+    net = sign * (median([row[6] for row in held_rows(rows)]) - initial_position_rad)
+    excursion = max(abs(row[6] - initial_position_rad) for row in rows)
+    sustained = sustained_current_a(rows)
+    peak = max(abs(row[8]) for row in rows)
+    required = max(BREAKAWAY_MIN_RAD,
+                   abs(target_delta_rad) * STATIC_PROBE_MIN_TRACKING_FRACTION)
+    breakaway = breakaway_current_a(rows, initial_position_rad, target_delta_rad)
+    if net >= required:
+        letter = "A"
+        verdict = "broke away and covered the requested displacement"
+    elif net >= BREAKAWAY_MIN_RAD:
+        letter = "B"
+        verdict = "broke away but stopped short of the requested displacement"
+    elif sustained >= STALL_CURRENT_A:
+        letter = "C"
+        verdict = ("no breakaway: net motion stayed inside the quantization and "
+                   "wind-up band while the commanded current was held")
+    else:
+        letter = "D"
+        verdict = "no breakaway and no meaningful current (MIT torque response unproven)"
+    return ProbeResult(net, excursion, sustained, peak, required, breakaway,
+                       letter, verdict)
 
 
 def policy_ramp_summary(rows, initial_position_rad, initial_target_rad):
@@ -180,10 +273,15 @@ def probe_ceiling_current_a(kp_cmd, requested_delta_rad):
 
 
 def max_probe_angle_deg(kp_cmd):
-    """Largest probe angle this axis can ask for without tripping the abort."""
+    """Largest probe angle this axis can ask for without tripping the abort.
+
+    The abort watches the reported |I|, which scatters above the commanded
+    Kp*error, so the commanded ceiling leaves a full noise peak of room.
+    """
     if kp_cmd <= 0:
         raise ValueError("kp must be positive")
-    reachable = CURRENT_ABORT_A * PROBE_CURRENT_HEADROOM / (kp_cmd * CURRENT_PER_KP_A_PER_RAD)
+    reachable = ((CURRENT_ABORT_A - FEEDBACK_CURRENT_NOISE_A)
+                 / (kp_cmd * CURRENT_PER_KP_A_PER_RAD))
     return min(STATIC_PROBE_MAX_DEG, float(np.rad2deg(reachable)))
 
 
@@ -194,7 +292,9 @@ def stall_guard(motor_id, kp_cmd, requested_delta_rad):
         f"probe ceiling |I| <= {ceiling:.2f}A for {np.rad2deg(requested_delta_rad):+.2f}deg "
         f"at Kp={kp_cmd:.3f}; this run can only move 0x{motor_id:02X} if its breakaway "
         f"current is below that, i.e. if its deadband is under "
-        f"{np.rad2deg(abs(requested_delta_rad)):.2f}deg."
+        f"{np.rad2deg(abs(requested_delta_rad)):.2f}deg. That ceiling is the "
+        f"commanded current; reported samples scatter about it by roughly "
+        f"+/-{FEEDBACK_CURRENT_NOISE_A:.2f}A."
     )
     known = DEMONSTRATED_STALL_CURRENT_A.get(motor_id)
     if known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
@@ -245,24 +345,88 @@ def deadband_lower_bound_rad(max_current_a, kp_cmd):
     return abs(max_current_a) / (kp_cmd * CURRENT_PER_KP_A_PER_RAD)
 
 
-def report_torque_path(motor_id, rows, kp_cmd, max_current_a):
-    """Print the Kt-free reading of one stationary run."""
+def report_torque_path(motor_id, rows, kp_cmd):
+    """Print the Kt-free reading of the MIT torque path itself."""
     slope, ratio, verdict = torque_path_summary(rows, kp_cmd)
     if slope is None:
         print(f"TORQUE PATH: 0x{motor_id:02X} {verdict}")
         return verdict
-    deadband = deadband_lower_bound_rad(max_current_a, kp_cmd)
     print(
         f"TORQUE PATH: 0x{motor_id:02X} |I|/error={slope:.2f}A/rad "
         f"(Kp={kp_cmd:.3f}, ratio={ratio:.2f}); {verdict}"
     )
-    if deadband is not None:
-        print(
-            f"DEADBAND: 0x{motor_id:02X} breakaway needs more than {max_current_a:.2f}A, "
-            f"so its position deadband at this Kp is at least "
-            f"{np.rad2deg(deadband):.2f}deg."
-        )
     return verdict
+
+
+def report_deadband(motor_id, kp_cmd, sustained_a, breakaway_a):
+    """State the deadband from the sustained current, never from a peak.
+
+    A peak sample is feedback noise; reading a physical bound off it
+    overstates the deadband, which is what the D9-3 screen log did.
+    """
+    if kp_cmd <= 0:
+        return
+    if breakaway_a is not None:
+        bound = deadband_lower_bound_rad(breakaway_a, kp_cmd)
+        print(
+            f"BREAKAWAY: 0x{motor_id:02X} started moving at |I|={breakaway_a:.2f}A, "
+            f"so its position deadband at this Kp is {np.rad2deg(bound):.2f}deg."
+        )
+        return
+    bound = deadband_lower_bound_rad(sustained_a, kp_cmd)
+    print(
+        f"DEADBAND: 0x{motor_id:02X} held a sustained {sustained_a:.2f}A without "
+        f"breaking away, so its position deadband at this Kp is at least "
+        f"{np.rad2deg(bound):.2f}deg (sustained current, not a peak sample)."
+    )
+
+
+# What each D9-3 letter means for the next action.  These are the pre-agreed
+# steps from handoffs/2026-09-22_d9-3_ブレークアウェイ判定.md.
+D9_3_NEXT_STEP = {
+    "A": ("ordinary stiction; 0x1C is healthy. Record the breakaway current and "
+          "deadband, then judge whether the policy survives that deadband before "
+          "any single-leg step."),
+    "B": ("the axis did break away, so it is not a mechanical fault. Record the "
+          "breakaway current and deadband. Do not repeat this run."),
+    "C": ("main power OFF. It did not break away at this current, so treat it as "
+          "mechanical: interference, fasteners, cable, support. Do not raise Kp, "
+          "the target angle or the current abort."),
+    "D": ("main power OFF. |I| = Kp*error does not hold here, so the premise of "
+          "this test is gone. Go back to the electrical and communication side "
+          "and leave the mechanism alone."),
+}
+# Exit codes, so a verdict is legible to a script without a traceback.
+D9_3_EXIT_CODE = {"A": 0, "B": 0, "C": 2, "D": 3}
+
+
+def d9_3_letter(result, torque_verdict):
+    """A verified torque path is the premise of A/B/C; without it the answer is D."""
+    if "verified" not in torque_verdict:
+        return "D"
+    return result.letter
+
+
+def report_probe(motor_id, rows, kp_cmd, result):
+    """Print the four D9-3 lines and return the scored letter."""
+    increments = int(round(BREAKAWAY_MIN_DEG / FEEDBACK_POSITION_LSB_DEG))
+    print(
+        f"STATIC PROBE: 0x{motor_id:02X} net sustained movement="
+        f"{np.rad2deg(result.net_rad):+.3f}deg toward the target "
+        f"(>= {np.rad2deg(result.required_rad):.3f}deg for A, "
+        f">= {BREAKAWAY_MIN_DEG:.1f}deg for B; that floor is {increments} feedback "
+        f"increments of {FEEDBACK_POSITION_LSB_DEG:.1f}deg); max excursion="
+        f"{np.rad2deg(result.excursion_rad):.3f}deg; sustained |current|="
+        f"{result.sustained_current_a:.2f}A (peak sample "
+        f"{result.peak_current_a:.2f}A); {result.verdict}"
+    )
+    torque_verdict = report_torque_path(motor_id, rows, kp_cmd)
+    report_deadband(motor_id, kp_cmd, result.sustained_current_a,
+                    result.breakaway_current_a)
+    letter = d9_3_letter(result, torque_verdict)
+    reason = torque_verdict if letter == "D" else result.verdict
+    print(f"VERDICT: D9-3 {letter} -- {reason}; next: {D9_3_NEXT_STEP[letter]}")
+    return letter
 
 
 class DualBus:
@@ -443,26 +607,12 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
                          requested[selected_index], wire_position, feedback_pos,
                          feedback_vel, state.cur))
             next_tick += PERIOD
-        max_tracking_rad, max_current_a, required_tracking_rad, verdict = static_probe_summary(
-            rows, start[selected_index], np.deg2rad(target_delta_deg)
-        )
-        print(
-            f"STATIC PROBE: 0x{motor_id:02X} max feedback movement="
-            f"{np.rad2deg(max_tracking_rad):.3f}deg "
-            f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
-            f"max |current|={max_current_a:.2f}A; {verdict}"
-        )
-        torque_verdict = report_torque_path(
-            motor_id, rows, wire_kp, max_current_a
-        )
-        if max_tracking_rad < required_tracking_rad:
-            verdict = f"{verdict}; {torque_verdict}"
-            raise RuntimeError(
-                f"static probe abort 0x{motor_id:02X}: feedback moved only "
-                f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= "
-                f"{np.rad2deg(required_tracking_rad):.3f}deg; "
-                f"max |current|={max_current_a:.2f}A; {verdict}."
-            )
+        # An axis that stays put is the measurement this probe exists to make,
+        # so it is scored and reported.  Only a real abort (current, speed,
+        # stale feedback, origin, stall guard) raises out of this run.
+        result = probe_result(rows, start[selected_index],
+                              np.deg2rad(target_delta_deg))
+        return report_probe(motor_id, rows, wire_kp, result)
     finally:
         if bus_opened:
             try:
@@ -625,10 +775,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
             f"max |current|={max_current_a:.2f}A; {tracking_verdict}"
         )
-        torque_verdict = report_torque_path(
-            selected_id, rows, wire_kp, max_current_a
-        )
+        torque_verdict = report_torque_path(selected_id, rows, wire_kp)
         if max_tracking_rad < required_tracking_rad:
+            report_deadband(selected_id, wire_kp, sustained_current_a(rows), None)
             tracking_verdict = f"{tracking_verdict}; {torque_verdict}"
             raise RuntimeError(
                 f"tracking abort 0x{selected_id:02X}: feedback moved only "
@@ -687,32 +836,39 @@ def analyze_csv(csv_path):
     kp_cmd = wire_command(motor_id, rows[0][5])[0]
     initial_position = rows[0][6]
     initial_target = rows[0][3]
-    if rows[0][1].startswith("probe"):
-        movement, max_current, required, verdict = static_probe_summary(
-            rows, initial_position, initial_target - initial_position
-        )
-    else:
-        movement, max_current, required, verdict = policy_ramp_summary(
-            rows, initial_position, initial_target
-        )
     stages = ", ".join(
         f"{stage}={sum(1 for row in rows if row[1] == stage)}"
         for stage in dict.fromkeys(row[1] for row in rows)
     )
     print(f"ANALYZE {csv_path}: 0x{motor_id:02X}; {len(rows)} rows ({stages})")
+    if rows[0][1].startswith("probe"):
+        result = probe_result(rows, initial_position,
+                              initial_target - initial_position)
+        letter = report_probe(motor_id, rows, kp_cmd, result)
+        ceiling = probe_ceiling_current_a(kp_cmd, initial_target - initial_position)
+        print(
+            f"PROBE CEILING: this run could only prove motion for a breakaway "
+            f"current below {ceiling:.2f}A (commanded)."
+        )
+        known = DEMONSTRATED_STALL_CURRENT_A.get(motor_id)
+        if letter == "C" and known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
+            print(
+                f"CAVEAT: that ceiling is at or below {known:.2f}A, which this axis "
+                "has already held without moving, so this run's C repeats a known "
+                "result instead of adding one."
+            )
+        return D9_3_EXIT_CODE[letter]
+    movement, max_current, required, verdict = policy_ramp_summary(
+        rows, initial_position, initial_target
+    )
     print(
         f"TRACKING: 0x{motor_id:02X} max feedback movement="
         f"{np.rad2deg(movement):.3f}deg (required >= {np.rad2deg(required):.3f}deg); "
         f"max |current|={max_current:.2f}A; {verdict}"
     )
-    report_torque_path(motor_id, rows, kp_cmd, max_current)
-    ceiling = probe_ceiling_current_a(
-        kp_cmd, initial_target - initial_position
-    )
-    print(
-        f"PROBE CEILING: this run could only prove motion for a breakaway current "
-        f"below {ceiling:.2f}A."
-    )
+    report_torque_path(motor_id, rows, kp_cmd)
+    report_deadband(motor_id, kp_cmd, sustained_current_a(rows), None)
+    return 0
 
 
 def main():
@@ -726,7 +882,7 @@ def main():
     a=p.parse_args()
     current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
     print(f"ver9_d8_sender build={BUILD_ID}; mode={current_mode}")
-    if a.analyze: analyze_csv(a.analyze); return 0
+    if a.analyze: return analyze_csv(a.analyze)
     if a.preview: preview(); return 0
     if not (a.arm or a.preflight): p.error('--arm is required for transmission; use --preflight for a receive-only live check')
     if a.static_probe:
@@ -746,8 +902,19 @@ def main():
                 f'{CURRENT_ABORT_A:.1f}A current abort trips before the target). '
                 'Do not raise Kp or the abort to get a larger angle.'
             )
-        run_static_probe(a.csv, a.motor_id[0], a.probe_target_deg, a.ramp_seconds, a.duration)
-        return
+        # Refuse a known-useless run before the operator powers anything up,
+        # not after the bus is open.  The same guard still runs inside the
+        # probe, immediately before the first MIT frame.
+        try:
+            stall_guard(a.motor_id[0], probe_kp, np.deg2rad(a.probe_target_deg))
+        except RuntimeError as error:
+            p.error(str(error))
+        letter = run_static_probe(a.csv, a.motor_id[0], a.probe_target_deg,
+                                  a.ramp_seconds, a.duration)
+        if letter in ("C", "D"):
+            print("Main power OFF before touching the machine. Do not re-run this "
+                  "probe, and do not raise Kp, the target angle or the current abort.")
+        return D9_3_EXIT_CODE[letter]
     if not a.package: p.error('--package is required')
     if a.preflight:
         # A path is still supplied so evidence is written consistently, but
@@ -760,4 +927,4 @@ def main():
         p.error('--arm requires exactly one registered --motor-id (for example, 0x1C)')
     run(a.package, a.duration, a.csv, a.vx, a.vy, a.wz,
         transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=tuple(a.motor_id))
-if __name__=='__main__': main()
+if __name__=='__main__': sys.exit(main() or 0)
