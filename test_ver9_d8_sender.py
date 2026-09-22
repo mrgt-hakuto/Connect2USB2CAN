@@ -641,3 +641,39 @@ class LateBreakawayTests(unittest.TestCase):
         rows = self._rows([0.0] * 12, [0.0] * 12, hold_from=4)
         self.assertEqual(len(sender.held_rows(rows)), 8)
         self.assertEqual(len(sender.hold_tail_rows(rows)), 2)
+
+
+class AllAxesFlagTests(unittest.TestCase):
+    """D10: the whole-body step must be explicit, never a slip of the wrist."""
+
+    _BASE = [
+        "ver9_d8_sender.py", "--arm", "--package", "pkg",
+        "--ramp-seconds", "15", "--duration", "2", "--csv", "out.csv",
+    ]
+
+    def test_all_axes_drives_every_registered_axis(self):
+        with patch.object(sys, "argv", self._BASE + ["--all-axes"]), \
+                patch.object(sender, "run") as run:
+            sender.main()
+        self.assertEqual(run.call_args.kwargs["motor_ids"], sender.H_CAN_IDS)
+
+    def test_all_axes_cannot_be_combined_with_a_single_motor_id(self):
+        argv = self._BASE + ["--all-axes", "--motor-id", "0x1C"]
+        with patch.object(sys, "argv", argv), \
+                patch.object(sender, "run") as run:
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+
+    def test_arm_without_all_axes_still_requires_one_motor_id(self):
+        with patch.object(sys, "argv", self._BASE), \
+                patch.object(sender, "run") as run:
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+
+    def test_single_axis_arm_is_unchanged(self):
+        argv = self._BASE + ["--motor-id", "0x1C"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run:
+            sender.main()
+        self.assertEqual(run.call_args.kwargs["motor_ids"], (0x1C,))

@@ -19,7 +19,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_LATEBREAK_20260923_0010"
+BUILD_ID = "D10_ALLAXES_20260923_0100"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -957,6 +957,7 @@ def main():
     mode.add_argument('--preflight',action='store_true', help='open/receive/evaluate once and print initial targets; sends zero CAN frames')
     p.add_argument('--static-probe', action='store_true', help='with --arm: one-axis fixed relative target; no policy/T265')
     p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg and within the per-axis current-abort limit')
+    p.add_argument('--all-axes', action='store_true', help='with --arm: drive all ten registered axes instead of one. Suspended robot only; every existing abort stays active')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
     current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
@@ -1002,8 +1003,23 @@ def main():
         return 0
     if not a.csv or not 0<a.duration<=5: p.error('--csv and 0<--duration<=5 are required with --arm')
     if a.ramp_seconds is None or a.ramp_seconds <= 0: p.error('--arm requires a positive --ramp-seconds value')
-    if not a.motor_id or len(a.motor_id) != 1 or a.motor_id[0] not in H_CAN_IDS:
-        p.error('--arm requires exactly one registered --motor-id (for example, 0x1C)')
+    if a.all_axes:
+        # Every axis at once is the whole-body step.  It is deliberate and
+        # explicit: --motor-id must not be given, so nobody reaches ten axes
+        # by accident while thinking they selected one.  The current, speed,
+        # stale-feedback and origin aborts all stay active and all of them
+        # still watch every axis, not just the logged one.
+        if a.motor_id:
+            p.error('--all-axes drives every registered axis; do not also pass --motor-id')
+        motor_ids = H_CAN_IDS
+        print(f"ALL AXES: driving all {len(H_CAN_IDS)} registered axes "
+              "(suspended robot only). Every abort stays active. "
+              f"Logged axis is 0x{H_CAN_IDS[0]:02X}.")
+    else:
+        if not a.motor_id or len(a.motor_id) != 1 or a.motor_id[0] not in H_CAN_IDS:
+            p.error('--arm requires exactly one registered --motor-id (for example, 0x1C), '
+                    'or --all-axes for the whole-body step')
+        motor_ids = tuple(a.motor_id)
     run(a.package, a.duration, a.csv, a.vx, a.vy, a.wz,
-        transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=tuple(a.motor_id))
+        transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids)
 if __name__=='__main__': sys.exit(main() or 0)
