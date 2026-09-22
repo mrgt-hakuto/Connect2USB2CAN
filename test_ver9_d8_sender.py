@@ -99,6 +99,16 @@ class SenderCleanupTests(unittest.TestCase):
             sender.main()
         self.assertFalse(run.call_args.kwargs["transmit"])
 
+    def test_main_static_probe_requires_arm_and_uses_no_policy_package(self):
+        argv = [
+            "ver9_d8_sender.py", "--arm", "--static-probe", "--motor-id", "0x1C",
+            "--probe-target-deg", "-2.5", "--ramp-seconds", "6", "--duration", "2",
+            "--csv", "out.csv",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run_static_probe") as probe:
+            sender.main()
+        self.assertEqual(probe.call_args.args[1:], (0x1C, -2.5, 6.0, 2.0))
+
     def test_default_buses_open_both_physical_channels(self):
         bus = sender.DualBus()
         self.assertEqual(tuple(bus.bus_by_channel), (0, 1))

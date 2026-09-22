@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_RAMP_20260922_1715"
+BUILD_ID = "D9_RAMP_20260922_1725"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -37,6 +37,9 @@ MIN_TRACKING_RAD = np.deg2rad(MIN_TRACKING_DEG)
 # feedback change distinguishes a loaded/stiction stall from a missing MIT
 # torque response.  It is diagnostic only; it never adds torque.
 STALL_CURRENT_A = 0.10
+# A static probe deliberately stays close to a D7 origin.  Its purpose is to
+# separate breakaway/stiction from the policy/T265 path, not to tune a joint.
+STATIC_PROBE_MAX_DEG = 2.5
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
 DAMPING = np.full(10, 1.5, dtype=float)
@@ -230,6 +233,91 @@ def preview():
         got=quantized_cmd(cmd,model)
         print(f"0x{mid:02X} {model} Kp={got[0]:.3f} Kd={got[1]:.3f} data={f_mit(mid,*cmd,model).data.hex()}")
 
+
+def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duration):
+    """One-axis, fixed-target MIT check with no policy package or T265 input."""
+    bus = DualBus()
+    rows = []
+    bus_opened = False
+    selected_index = H_CAN_IDS.index(motor_id)
+    try:
+        bus.open()
+        bus_opened = True
+        bus.discover_routes()
+        feedback = bus.feedback()
+        start = tuple(feedback[mid].position for mid in H_CAN_IDS)
+        target = list(start)
+        target[selected_index] += np.deg2rad(target_delta_deg)
+        target = tuple(target)
+        wire_kp, wire_kd, wire_target, _wire_vel, _wire_tau = wire_command(
+            motor_id, target[selected_index]
+        )
+        print(
+            f"STATIC PROBE active: motor=0x{motor_id:02X}; relative target="
+            f"{target_delta_deg:+.2f}deg; ramp={ramp_seconds:g}s; hold={duration:g}s"
+        )
+        print(
+            f"MIT wire check: 0x{motor_id:02X} Kp={wire_kp:.3f} Kd={wire_kd:.3f} "
+            f"target={np.rad2deg(wire_target):+.3f}deg; no policy/T265 input."
+        )
+        start_time = time.monotonic()
+        next_tick = start_time
+        end_ramp = start_time + ramp_seconds
+        end_hold = end_ramp + duration
+        while True:
+            now = time.monotonic()
+            if now >= end_hold:
+                break
+            time.sleep(max(0.0, next_tick - now))
+            tick = time.monotonic()
+            requested = ramp_targets(start, target, tick - start_time, ramp_seconds)
+            stage = "probe-ramp" if tick < end_ramp else "probe-hold"
+            # Keep every existing stale/error/current/speed gate active.
+            bus.feedback()
+            for frame in frames(requested, (motor_id,)):
+                bus.send(frame)
+            state = bus.state(motor_id)
+            feedback_pos, feedback_vel = servo_feedback_to_h_units(state.pos, state.spd)
+            _kp, _kd, wire_position, _vel, _tau = wire_command(motor_id, requested[selected_index])
+            rows.append((tick, stage, f"0x{motor_id:02X}", target[selected_index],
+                         requested[selected_index], wire_position, feedback_pos,
+                         feedback_vel, state.cur))
+            next_tick += PERIOD
+        max_tracking_rad, max_current_a, verdict = tracking_summary(
+            rows, start[selected_index]
+        )
+        print(
+            f"STATIC PROBE: 0x{motor_id:02X} max feedback movement="
+            f"{np.rad2deg(max_tracking_rad):.3f}deg; max |current|={max_current_a:.2f}A; {verdict}"
+        )
+        if max_tracking_rad < MIN_TRACKING_RAD:
+            raise RuntimeError(
+                f"static probe abort 0x{motor_id:02X}: feedback moved only "
+                f"{np.rad2deg(max_tracking_rad):.3f}deg; max |current|={max_current_a:.2f}A; {verdict}."
+            )
+    finally:
+        if bus_opened:
+            try:
+                bus.zero()
+            except Exception as error:
+                print(f"WARNING: zero MIT cleanup failed: {error}")
+            try:
+                bus.close()
+            except Exception as error:
+                print(f"WARNING: CAN cleanup failed: {error}")
+        try:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with csv_path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow((
+                    "tick", "stage", "sent_motor_id", "desired_target_rad",
+                    "requested_target_rad", "wire_target_rad", "feedback_position_rad",
+                    "feedback_velocity_rad_s", "feedback_current_a",
+                ))
+                writer.writerows(rows)
+        except Exception as error:
+            print(f"WARNING: CSV cleanup failed: {error}")
+
 def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS):
     policy=HPolicy(package); bus=DualBus(); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
@@ -402,11 +490,24 @@ def main():
     mode=p.add_mutually_exclusive_group()
     mode.add_argument('--arm',action='store_true')
     mode.add_argument('--preflight',action='store_true', help='open/receive/evaluate once and print initial targets; sends zero CAN frames')
+    p.add_argument('--static-probe', action='store_true', help='with --arm: one-axis fixed relative target; no policy/T265')
+    p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg')
     p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
-    print(f"ver9_d8_sender build={BUILD_ID}; mode={'arm' if a.arm else 'preflight' if a.preflight else 'none'}")
+    current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
+    print(f"ver9_d8_sender build={BUILD_ID}; mode={current_mode}")
     if a.preview: preview(); return 0
     if not (a.arm or a.preflight): p.error('--arm is required for transmission; use --preflight for a receive-only live check')
+    if a.static_probe:
+        if not a.arm or a.preflight: p.error('--static-probe requires --arm and cannot be combined with --preflight')
+        if not a.csv or not 0 < a.duration <= 5: p.error('--static-probe requires --csv and 0<--duration<=5')
+        if a.ramp_seconds is None or a.ramp_seconds <= 0: p.error('--static-probe requires a positive --ramp-seconds')
+        if not a.motor_id or len(a.motor_id) != 1 or a.motor_id[0] not in H_CAN_IDS:
+            p.error('--static-probe requires exactly one registered --motor-id')
+        if a.probe_target_deg is None or not 0 < abs(a.probe_target_deg) <= STATIC_PROBE_MAX_DEG:
+            p.error(f'--static-probe requires 0<abs(--probe-target-deg)<={STATIC_PROBE_MAX_DEG:g}')
+        run_static_probe(a.csv, a.motor_id[0], a.probe_target_deg, a.ramp_seconds, a.duration)
+        return
     if not a.package: p.error('--package is required')
     if a.preflight:
         # A path is still supplied so evidence is written consistently, but
