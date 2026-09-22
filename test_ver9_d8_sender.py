@@ -62,6 +62,30 @@ class TorquePathTests(unittest.TestCase):
         self.assertAlmostEqual(np.rad2deg(bound), 4.764, places=2)
 
 
+class ProbeAngleLimitTests(unittest.TestCase):
+    """The probe angle is bounded by the current abort, per axis."""
+
+    def test_ak10_hr_limit_is_the_absolute_ceiling(self):
+        # Kp 7.937 reaches 0.95 A at 6.86 deg, so the 7.0 deg ceiling binds.
+        self.assertAlmostEqual(sender.max_probe_angle_deg(7.937), 6.859, places=2)
+        self.assertLessEqual(sender.max_probe_angle_deg(7.937), sender.STATIC_PROBE_MAX_DEG)
+
+    def test_a_stiffer_axis_gets_a_smaller_limit(self):
+        # AK80-9 at stiffness 15 commands Kp 28.7; 7 deg there would be 3.5 A.
+        limit = sender.max_probe_angle_deg(28.7)
+        self.assertLess(limit, 2.0)
+        self.assertAlmostEqual(
+            np.deg2rad(limit) * 28.7,
+            sender.CURRENT_ABORT_A * sender.PROBE_CURRENT_HEADROOM,
+            places=6,
+        )
+
+    def test_the_approved_d9_3_angle_passes_the_stall_guard(self):
+        ceiling, _detail = sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
+        self.assertGreater(ceiling, sender.DEMONSTRATED_STALL_CURRENT_A[0x1C])
+        self.assertAlmostEqual(ceiling, 0.900, places=2)
+
+
 class StallGuardTests(unittest.TestCase):
     """A run that cannot move a healthy axis must not reach the CAN bus."""
 

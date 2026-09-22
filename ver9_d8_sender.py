@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_DIAG_20260922_1930"
+BUILD_ID = "D9_BREAKAWAY_20260922_2130"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -37,9 +37,16 @@ MIN_TRACKING_RAD = np.deg2rad(MIN_TRACKING_DEG)
 # feedback change distinguishes a loaded/stiction stall from a missing MIT
 # torque response.  It is diagnostic only; it never adds torque.
 STALL_CURRENT_A = 0.10
-# A static probe deliberately stays close to a D7 origin.  Its purpose is to
-# separate breakaway/stiction from the policy/T265 path, not to tune a joint.
-STATIC_PROBE_MAX_DEG = 2.5
+# A static probe separates breakaway/stiction from the policy/T265 path.  Its
+# angle is not a tuning knob: with |I| = Kp * error, the angle is simply how
+# much breakaway current the probe can reach, and CURRENT_ABORT_A caps that.
+# 2026-09-22 (user approved): raised from 2.5 to 7.0 deg because 0x1C stayed
+# still at 0.66 A, which 2.5 deg (0.35 A) could never exceed.  The per-axis
+# limit below is the binding one; this is only the absolute ceiling.
+STATIC_PROBE_MAX_DEG = 7.0
+# Stay clear of the current abort, so a probe ends on its own verdict rather
+# than on a trip partway up the ramp.
+PROBE_CURRENT_HEADROOM = 0.95
 # Seeing one encoder increment is insufficient for a fixed-target probe.  It
 # must cover a meaningful portion of the requested relative displacement.
 STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
@@ -170,6 +177,14 @@ def probe_ceiling_current_a(kp_cmd, requested_delta_rad):
     """Largest |I| a fixed-target run can reach while the axis stays put."""
     reachable = abs(kp_cmd) * CURRENT_PER_KP_A_PER_RAD * abs(requested_delta_rad)
     return min(reachable, CURRENT_ABORT_A)
+
+
+def max_probe_angle_deg(kp_cmd):
+    """Largest probe angle this axis can ask for without tripping the abort."""
+    if kp_cmd <= 0:
+        raise ValueError("kp must be positive")
+    reachable = CURRENT_ABORT_A * PROBE_CURRENT_HEADROOM / (kp_cmd * CURRENT_PER_KP_A_PER_RAD)
+    return min(STATIC_PROBE_MAX_DEG, float(np.rad2deg(reachable)))
 
 
 def stall_guard(motor_id, kp_cmd, requested_delta_rad):
@@ -706,7 +721,7 @@ def main():
     mode.add_argument('--arm',action='store_true')
     mode.add_argument('--preflight',action='store_true', help='open/receive/evaluate once and print initial targets; sends zero CAN frames')
     p.add_argument('--static-probe', action='store_true', help='with --arm: one-axis fixed relative target; no policy/T265')
-    p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg')
+    p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg and within the per-axis current-abort limit')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
     current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
@@ -720,8 +735,17 @@ def main():
         if a.ramp_seconds is None or a.ramp_seconds <= 0: p.error('--static-probe requires a positive --ramp-seconds')
         if not a.motor_id or len(a.motor_id) != 1 or a.motor_id[0] not in H_CAN_IDS:
             p.error('--static-probe requires exactly one registered --motor-id')
-        if a.probe_target_deg is None or not 0 < abs(a.probe_target_deg) <= STATIC_PROBE_MAX_DEG:
-            p.error(f'--static-probe requires 0<abs(--probe-target-deg)<={STATIC_PROBE_MAX_DEG:g}')
+        if a.probe_target_deg is None or abs(a.probe_target_deg) <= 0:
+            p.error('--static-probe requires a nonzero --probe-target-deg')
+        probe_kp = wire_command(a.motor_id[0], 0.0)[0]
+        probe_limit = max_probe_angle_deg(probe_kp)
+        if abs(a.probe_target_deg) > probe_limit:
+            p.error(
+                f'--probe-target-deg for 0x{a.motor_id[0]:02X} must satisfy '
+                f'abs(value)<={probe_limit:.2f} (Kp={probe_kp:.3f}; beyond that the '
+                f'{CURRENT_ABORT_A:.1f}A current abort trips before the target). '
+                'Do not raise Kp or the abort to get a larger angle.'
+            )
         run_static_probe(a.csv, a.motor_id[0], a.probe_target_deg, a.ramp_seconds, a.duration)
         return
     if not a.package: p.error('--package is required')
