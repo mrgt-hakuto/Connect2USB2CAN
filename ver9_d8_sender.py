@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_RAMP_20260922_1705"
+BUILD_ID = "D9_RAMP_20260922_1715"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -33,6 +33,10 @@ ORIGIN_ABORT_RAD = np.deg2rad(45.0)
 # never departs its D7 origin by even one servo-feedback display increment.
 MIN_TRACKING_DEG = 0.1
 MIN_TRACKING_RAD = np.deg2rad(MIN_TRACKING_DEG)
+# A current above this small, observed-noise-safe level with no position
+# feedback change distinguishes a loaded/stiction stall from a missing MIT
+# torque response.  It is diagnostic only; it never adds torque.
+STALL_CURRENT_A = 0.10
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
 DAMPING = np.full(10, 1.5, dtype=float)
@@ -84,6 +88,22 @@ def slew_target(previous, desired, max_rate_rad_s, elapsed_s):
         raise ValueError("slew rate and elapsed time must be nonnegative")
     max_step = max_rate_rad_s * elapsed_s
     return float(np.clip(desired, previous - max_step, previous + max_step))
+
+
+def tracking_summary(rows, initial_position_rad):
+    """Summarise one selected-axis run without inferring a torque direction."""
+    if not rows:
+        return 0.0, 0.0, "no selected-axis feedback samples"
+    max_movement = max(abs(row[6] - initial_position_rad) for row in rows)
+    max_current = max(abs(row[8]) for row in rows)
+    if max_movement < MIN_TRACKING_RAD:
+        if max_current >= STALL_CURRENT_A:
+            verdict = "position stalled under load (current present; static friction/mechanical load suspected)"
+        else:
+            verdict = "no position response and no meaningful current (MIT torque response unproven)"
+    else:
+        verdict = "position tracking observed"
+    return max_movement, max_current, verdict
 
 
 class DualBus:
@@ -330,18 +350,19 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 )
                 last_policy_progress = progress
             last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
-        max_tracking_rad = max(
-            (abs(row[6] - initial_positions[selected_index]) for row in rows), default=0.0
+        max_tracking_rad, max_current_a, tracking_verdict = tracking_summary(
+            rows, initial_positions[selected_index]
         )
         print(
             f"TRACKING: 0x{selected_id:02X} max feedback movement="
-            f"{np.rad2deg(max_tracking_rad):.3f}deg"
+            f"{np.rad2deg(max_tracking_rad):.3f}deg; "
+            f"max |current|={max_current_a:.2f}A; {tracking_verdict}"
         )
         if max_tracking_rad < MIN_TRACKING_RAD:
             raise RuntimeError(
                 f"tracking abort 0x{selected_id:02X}: feedback moved only "
                 f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= {MIN_TRACKING_DEG:.1f}deg. "
-                "MIT transmission completed, but position response was not proven."
+                f"max |current|={max_current_a:.2f}A; {tracking_verdict}."
             )
         print(f"POLICY complete: CAN tx={bus.tx_count}; sending selected-axis zero MIT cleanup.")
     finally:

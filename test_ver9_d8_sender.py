@@ -41,6 +41,22 @@ class SenderCleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             sender.slew_target(0.0, 1.0, -1.0, 0.1)
 
+    def test_tracking_summary_identifies_stall_from_current_without_motion(self):
+        rows = [
+            (0.0, "ramp", "0x1C", 0.0, -0.03, -0.03, 0.0, 0.0, -0.24),
+            (0.1, "policy", "0x1C", 0.0, -0.04, -0.04, 0.0, 0.0, -0.33),
+        ]
+        movement, current, verdict = sender.tracking_summary(rows, 0.0)
+        self.assertEqual(movement, 0.0)
+        self.assertAlmostEqual(current, 0.33)
+        self.assertIn("stalled under load", verdict)
+
+    def test_tracking_summary_identifies_missing_torque_response(self):
+        rows = [(0.0, "ramp", "0x1C", 0.0, -0.03, -0.03, 0.0, 0.0, 0.03)]
+        _movement, current, verdict = sender.tracking_summary(rows, 0.0)
+        self.assertAlmostEqual(current, 0.03)
+        self.assertIn("no meaningful current", verdict)
+
     def test_frames_can_limit_transmission_to_one_registered_motor(self):
         frames = sender.frames((0.0,) * len(sender.H_CAN_IDS), (0x1C,))
         self.assertEqual(len(frames), 1)
