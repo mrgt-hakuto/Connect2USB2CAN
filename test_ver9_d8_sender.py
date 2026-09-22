@@ -68,6 +68,17 @@ class SenderCleanupTests(unittest.TestCase):
         self.assertAlmostEqual(np.rad2deg(required), 1.25)
         self.assertIn("stalled before target", verdict)
 
+    def test_policy_ramp_requires_meaningful_fraction_of_initial_target(self):
+        rows = [(0.0, "ramp", "0x1C", -0.11, -0.11, -0.11,
+                 np.deg2rad(-0.3), 0.0, -0.81)]
+        movement, current, required, verdict = sender.policy_ramp_summary(
+            rows, np.deg2rad(-0.3), np.deg2rad(-6.4)
+        )
+        self.assertAlmostEqual(np.rad2deg(movement), 0.0)
+        self.assertAlmostEqual(current, 0.81)
+        self.assertAlmostEqual(np.rad2deg(required), 3.05)
+        self.assertIn("stalled during initial policy ramp", verdict)
+
     def test_frames_can_limit_transmission_to_one_registered_motor(self):
         frames = sender.frames((0.0,) * len(sender.H_CAN_IDS), (0x1C,))
         self.assertEqual(len(frames), 1)

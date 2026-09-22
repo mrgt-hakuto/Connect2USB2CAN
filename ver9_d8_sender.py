@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_RAMP_20260922_1735"
+BUILD_ID = "D9_RAMP_20260922_1745"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -43,6 +43,9 @@ STATIC_PROBE_MAX_DEG = 2.5
 # Seeing one encoder increment is insufficient for a fixed-target probe.  It
 # must cover a meaningful portion of the requested relative displacement.
 STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
+# The same criterion applies to the frozen first policy target: a one-axis
+# policy ramp has not succeeded when it moves only one encoder increment.
+POLICY_RAMP_MIN_TRACKING_FRACTION = 0.50
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
 DAMPING = np.full(10, 1.5, dtype=float)
@@ -121,6 +124,21 @@ def static_probe_summary(rows, initial_position_rad, target_delta_rad):
             verdict = "position stalled before target (current present; static friction/mechanical load suspected)"
         else:
             verdict = "no meaningful position response before target (MIT torque response unproven)"
+    return movement, current, required, verdict
+
+
+def policy_ramp_summary(rows, initial_position_rad, initial_target_rad):
+    """Require meaningful tracking of the frozen first policy-ramp target."""
+    movement, current, verdict = tracking_summary(rows, initial_position_rad)
+    required = max(
+        MIN_TRACKING_RAD,
+        abs(initial_target_rad - initial_position_rad) * POLICY_RAMP_MIN_TRACKING_FRACTION,
+    )
+    if movement < required:
+        if current >= STALL_CURRENT_A:
+            verdict = "position stalled during initial policy ramp (current present; static friction/mechanical load suspected)"
+        else:
+            verdict = "no meaningful policy-ramp response (MIT torque response unproven)"
     return movement, current, required, verdict
 
 
@@ -375,6 +393,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         wire_kp, wire_kd, initial_wire_target, _wire_vel, _wire_tau = wire_command(
             selected_id, initial_targets[selected_index]
         )
+        required_ramp_tracking = max(
+            MIN_TRACKING_RAD,
+            abs(initial_targets[selected_index] - initial_positions[selected_index])
+            * POLICY_RAMP_MIN_TRACKING_FRACTION,
+        )
         # The same maximum slope used for 0 -> first policy target also
         # guards the transition from the frozen initial target into live
         # policy output.  This prevents a first live-policy frame from
@@ -388,7 +411,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"MIT wire check: 0x{selected_id:02X} Kp={wire_kp:.3f} Kd={wire_kd:.3f} "
             f"target={np.rad2deg(initial_wire_target):+.3f}deg "
             f"(policy={np.rad2deg(initial_targets[selected_index]):+.3f}deg); "
-            f"requires >= {MIN_TRACKING_DEG:.1f}deg feedback movement."
+            f"requires >= {np.rad2deg(required_ramp_tracking):.3f}deg feedback movement."
         )
 
         # Do not apply the first policy target as a step.  The target is
@@ -457,18 +480,20 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 )
                 last_policy_progress = progress
             last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
-        max_tracking_rad, max_current_a, tracking_verdict = tracking_summary(
-            rows, initial_positions[selected_index]
+        max_tracking_rad, max_current_a, required_tracking_rad, tracking_verdict = policy_ramp_summary(
+            rows, initial_positions[selected_index], initial_targets[selected_index]
         )
         print(
             f"TRACKING: 0x{selected_id:02X} max feedback movement="
-            f"{np.rad2deg(max_tracking_rad):.3f}deg; "
+            f"{np.rad2deg(max_tracking_rad):.3f}deg "
+            f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
             f"max |current|={max_current_a:.2f}A; {tracking_verdict}"
         )
-        if max_tracking_rad < MIN_TRACKING_RAD:
+        if max_tracking_rad < required_tracking_rad:
             raise RuntimeError(
                 f"tracking abort 0x{selected_id:02X}: feedback moved only "
-                f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= {MIN_TRACKING_DEG:.1f}deg. "
+                f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= "
+                f"{np.rad2deg(required_tracking_rad):.3f}deg. "
                 f"max |current|={max_current_a:.2f}A; {tracking_verdict}."
             )
         print(f"POLICY complete: CAN tx={bus.tx_count}; sending selected-axis zero MIT cleanup.")
