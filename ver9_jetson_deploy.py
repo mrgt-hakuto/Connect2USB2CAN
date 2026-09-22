@@ -90,7 +90,7 @@ def run(args: argparse.Namespace) -> None:
     policy = HPolicy(args.package, providers=["TensorrtExecutionProvider", "CUDAExecutionProvider"])
     if not any(provider in policy.providers for provider in ("TensorrtExecutionProvider", "CUDAExecutionProvider")):
         controller.close(); raise RuntimeError(f"Jetson GPU provider unavailable: {policy.providers}")
-    bus, t265, opened, t265_started = DualBus(args.left_can_channel, args.right_can_channel), RealT265(T265_R_OFFSET_M), False, False
+    bus, t265, opened, t265_started = DualBus(), RealT265(T265_R_OFFSET_M), False, False
     last_action = np.zeros(ACTION_SIZE, dtype=np.float32)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -99,6 +99,7 @@ def run(args: argparse.Namespace) -> None:
         while t265.latest() is None:
             if time.monotonic() > deadline: raise RuntimeError("T265 warmup timeout")
             time.sleep(0.01)
+        bus.discover_routes()
         next_tick, end = time.monotonic(), time.monotonic() + args.duration
         with args.csv.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle); writer.writerow(("tick", "vx", "vy", "wz", *[f"target_h_{i}" for i in range(10)]))
@@ -121,7 +122,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Jetson full deployment; --arm is required for CAN transmit.")
     parser.add_argument("--preview", action="store_true"); parser.add_argument("--arm", action="store_true")
     parser.add_argument("--package", type=Path); parser.add_argument("--device"); parser.add_argument("--csv", type=Path); parser.add_argument("--duration", type=float, default=0.0)
-    parser.add_argument("--left-can-channel", type=int, default=0); parser.add_argument("--right-can-channel", type=int, default=1)
     parser.add_argument("--deadzone", type=float, default=0.05); parser.add_argument("--max-vx", type=float, default=0.30); parser.add_argument("--max-vy", type=float, default=0.20); parser.add_argument("--max-wz", type=float, default=0.30)
     args = parser.parse_args()
     if args.preview: preview(); print("Jetson mapping: left stick=VX/VY, A=+WZ, Y=-WZ; GPU provider required"); return 0

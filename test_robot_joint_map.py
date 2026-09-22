@@ -10,7 +10,6 @@ class RobotJointMapTests(unittest.TestCase):
         self.assertEqual(mapping.LEFT_CAN_IDS, (0x1C, 0x11, 0x21, 0x1A, 0x2B))
         self.assertEqual(mapping.RIGHT_CAN_IDS, (0x13, 0x1B, 0x2A, 0x12, 0x22))
         self.assertEqual(mapping.BY_ID[0x2A].name, "LR_HFE")
-        self.assertEqual(mapping.BY_ID[0x2A].channel, 1)
 
     def test_ver9_uses_the_shared_mapping(self):
         self.assertIs(integration.H_CAN_IDS, mapping.H_CAN_IDS)

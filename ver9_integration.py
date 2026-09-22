@@ -198,17 +198,18 @@ def run_synthetic(policy: HPolicy, duration_s: float, csv_path: Path) -> dict[st
 def run_live_dry(
     policy: PolicyEvaluator,
     t265: RealT265,
-    left_can: RealCan,
-    right_can: RealCan,
+    can_a: RealCan,
+    can_b: RealCan,
     command: FixedCommandSource,
     duration_s: float,
     csv_path: Path,
 ) -> dict[str, float | int]:
     """Read real D3/D4 inputs through the D8 policy path without sending CAN.
 
-    The caller supplies two receive-only ``RealCan`` sources: ch=0 for the
-    five left-leg IDs and ch=1 for the five right-leg IDs.  No source offered
-    to this function has a transmit method.
+    The caller supplies both receive-only ``RealCan`` sources.  gs_usb may
+    swap Python channel indices after reset, so feedback is merged by motor
+    ID rather than assigning a leg to a fixed channel.  No source offered to
+    this function has a transmit method.
     """
     if duration_s <= 0:
         raise ValueError("duration must be positive")
@@ -224,7 +225,7 @@ def run_live_dry(
     started: list[object] = []
     timer_resolution_changed = _set_windows_timer_resolution_1ms(True)
     try:
-        for source in (t265, left_can, right_can):
+        for source in (t265, can_a, can_b):
             source.start()
             started.append(source)
         warmup_deadline = time.monotonic() + 5.0
@@ -243,8 +244,8 @@ def run_live_dry(
                 t265_sample = t265.latest()
                 if t265_sample is None:
                     raise RuntimeError("T265 has not produced a pose sample")
-                feedback = left_can.latest(LEFT_CAN_IDS)
-                feedback.update(right_can.latest(RIGHT_CAN_IDS))
+                feedback = can_a.latest(H_CAN_IDS)
+                feedback.update(can_b.latest(H_CAN_IDS))
                 snapshot, observation, output, plan = evaluate_cycle(
                     policy, t265_sample, feedback, command.sample(tick), last_action,
                 )
@@ -272,7 +273,7 @@ def run_live_dry(
             source.close()
         if timer_resolution_changed:
             _set_windows_timer_resolution_1ms(False)
-    if left_can.tx_count or right_can.tx_count:
+    if can_a.tx_count or can_b.tx_count:
         raise RuntimeError("live dry run observed CAN transmission")
     return {"ticks": sequence, "overruns": overrun_count, "can_tx_count": 0}
 
@@ -283,8 +284,6 @@ def main() -> int:
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--live-dry", action="store_true", help="read T265 and both CAN channels, but never transmit")
-    parser.add_argument("--left-can-channel", type=int, default=0)
-    parser.add_argument("--right-can-channel", type=int, default=1)
     parser.add_argument("--can-bitrate", type=int, default=1_000_000)
     parser.add_argument("--fixed-vx", type=float, default=0.0)
     parser.add_argument("--fixed-vy", type=float, default=0.0)
@@ -297,8 +296,8 @@ def main() -> int:
             summary = run_live_dry(
                 policy,
                 RealT265(T265_R_OFFSET_M),
-                RealCan(args.left_can_channel, args.can_bitrate),
-                RealCan(args.right_can_channel, args.can_bitrate),
+                RealCan(0, args.can_bitrate),
+                RealCan(1, args.can_bitrate),
                 FixedCommandSource(args.fixed_vx, args.fixed_vy, args.fixed_wz),
                 args.duration,
                 args.csv,
