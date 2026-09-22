@@ -57,6 +57,17 @@ class SenderCleanupTests(unittest.TestCase):
         self.assertAlmostEqual(current, 0.03)
         self.assertIn("no meaningful current", verdict)
 
+    def test_static_probe_requires_meaningful_fraction_of_requested_motion(self):
+        rows = [(0.0, "probe-hold", "0x1C", -0.04, -0.04, -0.04,
+                 np.deg2rad(-0.3), 0.0, -0.34)]
+        movement, current, required, verdict = sender.static_probe_summary(
+            rows, 0.0, np.deg2rad(-2.5)
+        )
+        self.assertAlmostEqual(np.rad2deg(movement), 0.3)
+        self.assertAlmostEqual(current, 0.34)
+        self.assertAlmostEqual(np.rad2deg(required), 1.25)
+        self.assertIn("stalled before target", verdict)
+
     def test_frames_can_limit_transmission_to_one_registered_motor(self):
         frames = sender.frames((0.0,) * len(sender.H_CAN_IDS), (0x1C,))
         self.assertEqual(len(frames), 1)

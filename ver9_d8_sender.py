@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_RAMP_20260922_1725"
+BUILD_ID = "D9_RAMP_20260922_1735"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -40,6 +40,9 @@ STALL_CURRENT_A = 0.10
 # A static probe deliberately stays close to a D7 origin.  Its purpose is to
 # separate breakaway/stiction from the policy/T265 path, not to tune a joint.
 STATIC_PROBE_MAX_DEG = 2.5
+# Seeing one encoder increment is insufficient for a fixed-target probe.  It
+# must cover a meaningful portion of the requested relative displacement.
+STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
 DAMPING = np.full(10, 1.5, dtype=float)
@@ -107,6 +110,18 @@ def tracking_summary(rows, initial_position_rad):
     else:
         verdict = "position tracking observed"
     return max_movement, max_current, verdict
+
+
+def static_probe_summary(rows, initial_position_rad, target_delta_rad):
+    """Require a static probe to cover half of its requested displacement."""
+    movement, current, verdict = tracking_summary(rows, initial_position_rad)
+    required = max(MIN_TRACKING_RAD, abs(target_delta_rad) * STATIC_PROBE_MIN_TRACKING_FRACTION)
+    if movement < required:
+        if current >= STALL_CURRENT_A:
+            verdict = "position stalled before target (current present; static friction/mechanical load suspected)"
+        else:
+            verdict = "no meaningful position response before target (MIT torque response unproven)"
+    return movement, current, required, verdict
 
 
 class DualBus:
@@ -283,17 +298,21 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
                          requested[selected_index], wire_position, feedback_pos,
                          feedback_vel, state.cur))
             next_tick += PERIOD
-        max_tracking_rad, max_current_a, verdict = tracking_summary(
-            rows, start[selected_index]
+        max_tracking_rad, max_current_a, required_tracking_rad, verdict = static_probe_summary(
+            rows, start[selected_index], np.deg2rad(target_delta_deg)
         )
         print(
             f"STATIC PROBE: 0x{motor_id:02X} max feedback movement="
-            f"{np.rad2deg(max_tracking_rad):.3f}deg; max |current|={max_current_a:.2f}A; {verdict}"
+            f"{np.rad2deg(max_tracking_rad):.3f}deg "
+            f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
+            f"max |current|={max_current_a:.2f}A; {verdict}"
         )
-        if max_tracking_rad < MIN_TRACKING_RAD:
+        if max_tracking_rad < required_tracking_rad:
             raise RuntimeError(
                 f"static probe abort 0x{motor_id:02X}: feedback moved only "
-                f"{np.rad2deg(max_tracking_rad):.3f}deg; max |current|={max_current_a:.2f}A; {verdict}."
+                f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= "
+                f"{np.rad2deg(required_tracking_rad):.3f}deg; "
+                f"max |current|={max_current_a:.2f}A; {verdict}."
             )
     finally:
         if bus_opened:
