@@ -17,7 +17,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_RAMP_20260922_1745"
+BUILD_ID = "D9_DIAG_20260922_1930"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -46,6 +46,30 @@ STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
 # The same criterion applies to the frozen first policy target: a one-axis
 # policy ramp has not succeeded when it moves only one encoder increment.
 POLICY_RAMP_MIN_TRACKING_FRACTION = 0.50
+# 2026-09-22, measured from the two saved 0x1C runs (see
+# reports/2026-09-22_d9-0x1c-current-vs-error.md): the MIT Kp field acts as
+# "amps of phase current per radian of position error", with no model factor.
+# A least squares fit of |I| against |error| gave 7.918 and 7.553 A/rad for a
+# commanded Kp of 7.937, intercept |b| <= 0.02 A.  Physical torque is that
+# current times Kt, and Kt is still unmeasured for the AK10-9, so every
+# decision below is expressed in current so that it does not depend on Kt.
+CURRENT_PER_KP_A_PER_RAD = 1.0
+# Slope of |I| over error, divided by the commanded Kp.  Inside this band the
+# MIT torque path is doing its job and a motionless axis is a mechanical fact;
+# near zero the command is not reaching the motor at all.
+TORQUE_PATH_SLOPE_TOLERANCE = 0.25
+TORQUE_PATH_ABSENT_RATIO = 0.25
+TORQUE_PATH_MIN_SAMPLES = 20
+TORQUE_PATH_MIN_ERROR_RAD = np.deg2rad(0.5)
+# A position loop can only move an axis where Kp * error exceeds its breakaway
+# current.  A fixed-target run therefore probes breakaway only up to
+# Kp * |target - position|.  A run whose ceiling is at or below a current that
+# already left this axis stationary cannot produce new information, whatever
+# its target angle, so it is refused before a single MIT frame.  Raising Kp,
+# the target or the torque field to clear this guard is not permitted; the
+# mechanical load or the diagnostic itself has to change.
+DEMONSTRATED_STALL_CURRENT_A = {0x1C: 0.66}
+STALL_GUARD_MARGIN_A = 0.05
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
 DAMPING = np.full(10, 1.5, dtype=float)
@@ -140,6 +164,90 @@ def policy_ramp_summary(rows, initial_position_rad, initial_target_rad):
         else:
             verdict = "no meaningful policy-ramp response (MIT torque response unproven)"
     return movement, current, required, verdict
+
+
+def probe_ceiling_current_a(kp_cmd, requested_delta_rad):
+    """Largest |I| a fixed-target run can reach while the axis stays put."""
+    reachable = abs(kp_cmd) * CURRENT_PER_KP_A_PER_RAD * abs(requested_delta_rad)
+    return min(reachable, CURRENT_ABORT_A)
+
+
+def stall_guard(motor_id, kp_cmd, requested_delta_rad):
+    """Refuse, before any MIT frame, a run that cannot move a healthy axis."""
+    ceiling = probe_ceiling_current_a(kp_cmd, requested_delta_rad)
+    detail = (
+        f"probe ceiling |I| <= {ceiling:.2f}A for {np.rad2deg(requested_delta_rad):+.2f}deg "
+        f"at Kp={kp_cmd:.3f}; this run can only move 0x{motor_id:02X} if its breakaway "
+        f"current is below that, i.e. if its deadband is under "
+        f"{np.rad2deg(abs(requested_delta_rad)):.2f}deg."
+    )
+    known = DEMONSTRATED_STALL_CURRENT_A.get(motor_id)
+    if known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
+        raise RuntimeError(
+            f"repeat-probe abort 0x{motor_id:02X}: {detail} That axis already stayed "
+            f"stationary at {known:.2f}A, so this run repeats a known result. Do not "
+            "raise Kp, the target angle or the torque field to get past this; change "
+            "the mechanical load, or run a separately reviewed diagnostic."
+        )
+    return ceiling, detail
+
+
+def torque_path_summary(rows, kp_cmd):
+    """Judge the MIT torque path itself, from |I| against commanded error.
+
+    This is independent of whether the axis moved.  While the axis is
+    stationary the commanded position error is known exactly, so the slope of
+    |I| over that error says whether Kp reached the motor at all.  It needs no
+    Kt, adds no torque and sends nothing.
+    """
+    samples = [(abs(row[5] - row[6]), abs(row[8])) for row in rows]
+    samples = [pair for pair in samples if pair[0] >= TORQUE_PATH_MIN_ERROR_RAD]
+    if kp_cmd <= 0 or len(samples) < TORQUE_PATH_MIN_SAMPLES:
+        return None, None, "torque path undetermined (too few loaded samples)"
+    count = len(samples)
+    sum_e = sum(error for error, _ in samples)
+    sum_i = sum(current for _, current in samples)
+    sum_ee = sum(error * error for error, _ in samples)
+    sum_ei = sum(error * current for error, current in samples)
+    denominator = count * sum_ee - sum_e * sum_e
+    if denominator <= 0:
+        return None, None, "torque path undetermined (no spread in position error)"
+    slope = (count * sum_ei - sum_e * sum_i) / denominator
+    ratio = slope / (kp_cmd * CURRENT_PER_KP_A_PER_RAD)
+    if abs(ratio - 1.0) <= TORQUE_PATH_SLOPE_TOLERANCE:
+        verdict = "MIT torque path verified (|I| follows Kp*error)"
+    elif ratio <= TORQUE_PATH_ABSENT_RATIO:
+        verdict = "MIT torque absent (|I| does not follow Kp*error; route/mode/gain suspect)"
+    else:
+        verdict = "MIT torque path anomalous (|I| slope disagrees with the commanded Kp)"
+    return slope, ratio, verdict
+
+
+def deadband_lower_bound_rad(max_current_a, kp_cmd):
+    """Breakaway deadband implied by a stationary axis, without using Kt."""
+    if kp_cmd <= 0:
+        return None
+    return abs(max_current_a) / (kp_cmd * CURRENT_PER_KP_A_PER_RAD)
+
+
+def report_torque_path(motor_id, rows, kp_cmd, max_current_a):
+    """Print the Kt-free reading of one stationary run."""
+    slope, ratio, verdict = torque_path_summary(rows, kp_cmd)
+    if slope is None:
+        print(f"TORQUE PATH: 0x{motor_id:02X} {verdict}")
+        return verdict
+    deadband = deadband_lower_bound_rad(max_current_a, kp_cmd)
+    print(
+        f"TORQUE PATH: 0x{motor_id:02X} |I|/error={slope:.2f}A/rad "
+        f"(Kp={kp_cmd:.3f}, ratio={ratio:.2f}); {verdict}"
+    )
+    if deadband is not None:
+        print(
+            f"DEADBAND: 0x{motor_id:02X} breakaway needs more than {max_current_a:.2f}A, "
+            f"so its position deadband at this Kp is at least "
+            f"{np.rad2deg(deadband):.2f}deg."
+        )
+    return verdict
 
 
 class DualBus:
@@ -293,6 +401,10 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
             f"MIT wire check: 0x{motor_id:02X} Kp={wire_kp:.3f} Kd={wire_kd:.3f} "
             f"target={np.rad2deg(wire_target):+.3f}deg; no policy/T265 input."
         )
+        _ceiling, ceiling_detail = stall_guard(
+            motor_id, wire_kp, np.deg2rad(target_delta_deg)
+        )
+        print("STALL GUARD: " + ceiling_detail)
         start_time = time.monotonic()
         next_tick = start_time
         end_ramp = start_time + ramp_seconds
@@ -325,7 +437,11 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
             f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
             f"max |current|={max_current_a:.2f}A; {verdict}"
         )
+        torque_verdict = report_torque_path(
+            motor_id, rows, wire_kp, max_current_a
+        )
         if max_tracking_rad < required_tracking_rad:
+            verdict = f"{verdict}; {torque_verdict}"
             raise RuntimeError(
                 f"static probe abort 0x{motor_id:02X}: feedback moved only "
                 f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= "
@@ -413,6 +529,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"(policy={np.rad2deg(initial_targets[selected_index]):+.3f}deg); "
             f"requires >= {np.rad2deg(required_ramp_tracking):.3f}deg feedback movement."
         )
+        _ceiling, ceiling_detail = stall_guard(
+            selected_id, wire_kp,
+            initial_targets[selected_index] - initial_positions[selected_index],
+        )
+        print("STALL GUARD: " + ceiling_detail)
 
         # Do not apply the first policy target as a step.  The target is
         # frozen for this transition; after the ramp, the ordinary policy
@@ -489,7 +610,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
             f"max |current|={max_current_a:.2f}A; {tracking_verdict}"
         )
+        torque_verdict = report_torque_path(
+            selected_id, rows, wire_kp, max_current_a
+        )
         if max_tracking_rad < required_tracking_rad:
+            tracking_verdict = f"{tracking_verdict}; {torque_verdict}"
             raise RuntimeError(
                 f"tracking abort 0x{selected_id:02X}: feedback moved only "
                 f"{np.rad2deg(max_tracking_rad):.3f}deg; required >= "
@@ -529,6 +654,52 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         except Exception as error:
             print(f"WARNING: CSV cleanup failed: {error}")
 
+def analyze_csv(csv_path):
+    """Re-judge a saved one-axis CSV.  Opens no bus and sends no CAN frame."""
+    with csv_path.open(newline="", encoding="utf-8") as file:
+        records = list(csv.DictReader(file))
+    if not records:
+        raise RuntimeError(f"no rows in {csv_path}")
+    motor_id = int(records[0]["sent_motor_id"], 16)
+    if motor_id not in H_CAN_IDS:
+        raise RuntimeError(f"{csv_path} is not a registered H axis")
+    rows = [(
+        float(record["tick"]), record["stage"], record["sent_motor_id"],
+        float(record["desired_target_rad"]), float(record["requested_target_rad"]),
+        float(record["wire_target_rad"]), float(record["feedback_position_rad"]),
+        float(record["feedback_velocity_rad_s"]), float(record["feedback_current_a"]),
+    ) for record in records]
+    kp_cmd = wire_command(motor_id, rows[0][5])[0]
+    initial_position = rows[0][6]
+    initial_target = rows[0][3]
+    if rows[0][1].startswith("probe"):
+        movement, max_current, required, verdict = static_probe_summary(
+            rows, initial_position, initial_target - initial_position
+        )
+    else:
+        movement, max_current, required, verdict = policy_ramp_summary(
+            rows, initial_position, initial_target
+        )
+    stages = ", ".join(
+        f"{stage}={sum(1 for row in rows if row[1] == stage)}"
+        for stage in dict.fromkeys(row[1] for row in rows)
+    )
+    print(f"ANALYZE {csv_path}: 0x{motor_id:02X}; {len(rows)} rows ({stages})")
+    print(
+        f"TRACKING: 0x{motor_id:02X} max feedback movement="
+        f"{np.rad2deg(movement):.3f}deg (required >= {np.rad2deg(required):.3f}deg); "
+        f"max |current|={max_current:.2f}A; {verdict}"
+    )
+    report_torque_path(motor_id, rows, kp_cmd, max_current)
+    ceiling = probe_ceiling_current_a(
+        kp_cmd, initial_target - initial_position
+    )
+    print(
+        f"PROBE CEILING: this run could only prove motion for a breakaway current "
+        f"below {ceiling:.2f}A."
+    )
+
+
 def main():
     p=argparse.ArgumentParser(description='D8 10-axis MIT sender; --arm is required for any CAN transmit.')
     mode=p.add_mutually_exclusive_group()
@@ -536,10 +707,11 @@ def main():
     mode.add_argument('--preflight',action='store_true', help='open/receive/evaluate once and print initial targets; sends zero CAN frames')
     p.add_argument('--static-probe', action='store_true', help='with --arm: one-axis fixed relative target; no policy/T265')
     p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg')
-    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
+    p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
     current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
     print(f"ver9_d8_sender build={BUILD_ID}; mode={current_mode}")
+    if a.analyze: analyze_csv(a.analyze); return 0
     if a.preview: preview(); return 0
     if not (a.arm or a.preflight): p.error('--arm is required for transmission; use --preflight for a receive-only live check')
     if a.static_probe:

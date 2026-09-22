@@ -17,6 +17,75 @@ sys.modules[SPEC.name] = sender
 SPEC.loader.exec_module(sender)
 
 
+class TorquePathTests(unittest.TestCase):
+    """The Kt-free reading of a stationary axis: |I| against commanded error."""
+
+    @staticmethod
+    def _stationary_rows(kp_cmd, slope_ratio, count=60):
+        # The axis never moves, so the commanded error is exactly the wire
+        # target minus the fixed feedback position.
+        rows = []
+        for index in range(count):
+            error = np.deg2rad(0.5 + 0.1 * index)
+            current = -slope_ratio * kp_cmd * error
+            rows.append((0.02 * index, "ramp", "0x1C", -0.09, -error, -error,
+                         0.0, 0.0, current))
+        return rows
+
+    def test_slope_matching_kp_verifies_the_mit_torque_path(self):
+        rows = self._stationary_rows(7.937, 1.0)
+        slope, ratio, verdict = sender.torque_path_summary(rows, 7.937)
+        self.assertAlmostEqual(ratio, 1.0, places=6)
+        self.assertAlmostEqual(slope, 7.937, places=4)
+        self.assertIn("verified", verdict)
+
+    def test_absent_current_response_is_not_called_a_mechanical_stall(self):
+        rows = self._stationary_rows(7.937, 0.02)
+        _slope, _ratio, verdict = sender.torque_path_summary(rows, 7.937)
+        self.assertIn("absent", verdict)
+
+    def test_slope_far_from_kp_is_reported_as_anomalous(self):
+        rows = self._stationary_rows(7.937, 0.5)
+        _slope, _ratio, verdict = sender.torque_path_summary(rows, 7.937)
+        self.assertIn("anomalous", verdict)
+
+    def test_too_few_loaded_samples_stay_undetermined(self):
+        rows = self._stationary_rows(7.937, 1.0, count=5)
+        slope, ratio, verdict = sender.torque_path_summary(rows, 7.937)
+        self.assertIsNone(slope)
+        self.assertIsNone(ratio)
+        self.assertIn("undetermined", verdict)
+
+    def test_deadband_lower_bound_uses_current_and_kp_only(self):
+        # 0.66 A that did not move the axis, at Kp = 7.937, is 4.76 deg.
+        bound = sender.deadband_lower_bound_rad(0.66, 7.937)
+        self.assertAlmostEqual(np.rad2deg(bound), 4.764, places=2)
+
+
+class StallGuardTests(unittest.TestCase):
+    """A run that cannot move a healthy axis must not reach the CAN bus."""
+
+    def test_probe_ceiling_is_kp_times_the_requested_error(self):
+        self.assertAlmostEqual(
+            sender.probe_ceiling_current_a(7.937, np.deg2rad(4.524)), 0.6266, places=3
+        )
+
+    def test_probe_ceiling_is_capped_by_the_current_abort_limit(self):
+        self.assertEqual(
+            sender.probe_ceiling_current_a(7.937, np.deg2rad(90.0)),
+            sender.CURRENT_ABORT_A,
+        )
+
+    def test_repeat_of_a_known_stall_is_refused_before_any_send(self):
+        with self.assertRaisesRegex(RuntimeError, "repeat-probe abort"):
+            sender.stall_guard(0x1C, 7.937, np.deg2rad(-4.524))
+
+    def test_guard_passes_an_axis_with_no_recorded_stall(self):
+        ceiling, detail = sender.stall_guard(0x13, 7.937, np.deg2rad(-4.524))
+        self.assertGreater(ceiling, 0.0)
+        self.assertIn("probe ceiling", detail)
+
+
 class SenderCleanupTests(unittest.TestCase):
     def test_ramp_targets_start_midpoint_and_finish(self):
         start = (0.0,) * len(sender.H_CAN_IDS)
