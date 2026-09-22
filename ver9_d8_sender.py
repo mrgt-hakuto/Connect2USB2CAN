@@ -19,7 +19,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D9_VERDICT_20260922_2015"
+BUILD_ID = "D9_LATEBREAK_20260923_0010"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -69,6 +69,13 @@ BREAKAWAY_MIN_RAD = np.deg2rad(BREAKAWAY_MIN_DEG)
 # Seeing one encoder increment is insufficient for a fixed-target probe.  It
 # must cover a meaningful portion of the requested relative displacement.
 STATIC_PROBE_MIN_TRACKING_FRACTION = 0.50
+# Where the axis ENDED UP during the hold, not its average over the hold.  A
+# breakaway in the last second leaves the median sitting on the stationary
+# part before it.  D9-6 scored a real 3.5 deg move as 0.2 deg that way.
+HOLD_TAIL_FRACTION = 0.25
+# Samples to look back over for the current the axis was holding just before
+# it let go.  0.2 s at 50 Hz.
+BREAKAWAY_LOOKBACK_SAMPLES = 10
 # The same criterion applies to the frozen first policy target: a one-axis
 # policy ramp has not succeeded when it moves only one encoder increment.
 POLICY_RAMP_MIN_TRACKING_FRACTION = 0.50
@@ -99,7 +106,17 @@ TORQUE_PATH_MIN_ERROR_RAD = np.deg2rad(0.5)
 # sustained over the hold stage).  With Kp 7.937 the largest angle the current
 # abort allows is 6.64 deg, i.e. 0.92 A commanded, so this method has almost no
 # headroom left and a repeat of the 6.5 deg run is now refused before any send.
-DEMONSTRATED_STALL_CURRENT_A = {0x1C: 0.86}
+# 2026-09-22 D9-4/D9-6: a stall is evidence about one axis *in one direction*,
+# so the record is keyed that way.  It is now EMPTY: D9-6 broke 0x1C away in
+# the positive direction at 0.90 A (logs/d9_6a_hr_pos_supported_0x1c.csv, net
+# +3.50 deg), so "0x1C stays stationary at 0.86 A" is no longer true and must
+# not refuse further runs.  The earlier C verdicts were a scoring bug, not a
+# stalled axis: the axis let go in the last second of the hold and the median
+# over the whole hold sat on the stationary part before it.
+# Add an entry only for an axis that genuinely held a current without moving,
+# and delete it when the mechanical load changes; do not raise Kp, the angle,
+# the torque field or the abort to get past this guard.
+DEMONSTRATED_STALL_CURRENT_A = {}
 STALL_GUARD_MARGIN_A = 0.05
 # H deployment stiffness/damping, converted with the measured c_p/c_d.
 STIFFNESS = np.array((10,10,15,15,15,15,15,15,10,10), dtype=float)
@@ -206,12 +223,34 @@ def sustained_current_a(rows):
     return median([abs(row[8]) for row in held_rows(rows)])
 
 
+def hold_tail_rows(rows):
+    """The last part of the hold: where the axis ended up, not its average.
+
+    2026-09-22 D9-6: three runs broke away in the final second of the hold and
+    then ran toward the target while the error, and so the current, collapsed.
+    A median over the whole hold is dominated by the stationary part before
+    that, so it scored a 3.5 deg breakaway as 0.2 deg of dither.  Where the
+    axis finished is the measurement; how long it took to let go is not.
+    """
+    hold = held_rows(rows)
+    tail = max(1, int(round(len(hold) * HOLD_TAIL_FRACTION)))
+    return hold[-tail:]
+
+
 def breakaway_current_a(rows, initial_position_rad, target_delta_rad):
-    """|I| at the first sample past the quantization/wind-up band, if any."""
+    """|I| the axis was holding immediately BEFORE it let go, if it did.
+
+    Not the current at the first moved sample: by then the axis is already
+    running and Kp*error, hence the current, has collapsed.  D9-6 read 0.02 A
+    off 0x13 that way while it had been holding about 0.3 A one sample earlier.
+    """
     sign = 1.0 if target_delta_rad >= 0 else -1.0
-    for row in rows:
+    for index, row in enumerate(rows):
         if sign * (row[6] - initial_position_rad) >= BREAKAWAY_MIN_RAD:
-            return abs(row[8])
+            window = rows[max(0, index - BREAKAWAY_LOOKBACK_SAMPLES):index]
+            if not window:
+                return abs(row[8])
+            return max(abs(sample[8]) for sample in window)
     return None
 
 
@@ -227,7 +266,7 @@ def probe_result(rows, initial_position_rad, target_delta_rad):
         return ProbeResult(0.0, 0.0, 0.0, 0.0, 0.0, None, "D",
                            "no selected-axis feedback samples")
     sign = 1.0 if target_delta_rad >= 0 else -1.0
-    net = sign * (median([row[6] for row in held_rows(rows)]) - initial_position_rad)
+    net = sign * (median([row[6] for row in hold_tail_rows(rows)]) - initial_position_rad)
     excursion = max(abs(row[6] - initial_position_rad) for row in rows)
     sustained = sustained_current_a(rows)
     peak = max(abs(row[8]) for row in rows)
@@ -285,9 +324,26 @@ def max_probe_angle_deg(kp_cmd):
     return min(STATIC_PROBE_MAX_DEG, float(np.rad2deg(reachable)))
 
 
+def probe_direction(requested_delta_rad):
+    """+1 or -1: which way this probe pushes.  Stall evidence is per direction."""
+    return 1 if requested_delta_rad >= 0 else -1
+
+
+def direction_label(direction):
+    return "positive" if direction >= 0 else "negative"
+
+
+def demonstrated_stall_current_a(motor_id, requested_delta_rad):
+    """|I| this axis has already held *on this side* without breaking away."""
+    return DEMONSTRATED_STALL_CURRENT_A.get(
+        (motor_id, probe_direction(requested_delta_rad))
+    )
+
+
 def stall_guard(motor_id, kp_cmd, requested_delta_rad):
     """Refuse, before any MIT frame, a run that cannot move a healthy axis."""
     ceiling = probe_ceiling_current_a(kp_cmd, requested_delta_rad)
+    direction = probe_direction(requested_delta_rad)
     detail = (
         f"probe ceiling |I| <= {ceiling:.2f}A for {np.rad2deg(requested_delta_rad):+.2f}deg "
         f"at Kp={kp_cmd:.3f}; this run can only move 0x{motor_id:02X} if its breakaway "
@@ -296,13 +352,24 @@ def stall_guard(motor_id, kp_cmd, requested_delta_rad):
         f"commanded current; reported samples scatter about it by roughly "
         f"+/-{FEEDBACK_CURRENT_NOISE_A:.2f}A."
     )
-    known = DEMONSTRATED_STALL_CURRENT_A.get(motor_id)
+    known = demonstrated_stall_current_a(motor_id, requested_delta_rad)
     if known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
+        opposite = DEMONSTRATED_STALL_CURRENT_A.get((motor_id, -direction))
+        hint = (
+            ""
+            if opposite is not None
+            else (
+                f" The {direction_label(-direction)} direction has not been probed; "
+                "if the mechanism can only be blocked on one side, that run is new "
+                "information rather than a repeat."
+            )
+        )
         raise RuntimeError(
             f"repeat-probe abort 0x{motor_id:02X}: {detail} That axis already stayed "
-            f"stationary at {known:.2f}A, so this run repeats a known result. Do not "
-            "raise Kp, the target angle or the torque field to get past this; change "
-            "the mechanical load, or run a separately reviewed diagnostic."
+            f"stationary at {known:.2f}A in the {direction_label(direction)} "
+            f"direction, so this run repeats a known result. Do not raise Kp, the "
+            "target angle or the torque field to get past this; change the mechanical "
+            f"load, or run a separately reviewed diagnostic.{hint}"
         )
     return ceiling, detail
 
@@ -390,8 +457,10 @@ D9_3_NEXT_STEP = {
     "B": ("the axis did break away, so it is not a mechanical fault. Record the "
           "breakaway current and deadband. Do not repeat this run."),
     "C": ("main power OFF. It did not break away at this current, so treat it as "
-          "mechanical: interference, fasteners, cable, support. Do not raise Kp, "
-          "the target angle or the current abort."),
+          "mechanical: interference, fasteners, cable, support. This says nothing "
+          "about the other direction -- a hard stop blocks one side only, so check "
+          "both by hand with the power off before calling the axis faulty. Do not "
+          "raise Kp, the target angle or the current abort."),
     "D": ("main power OFF. |I| = Kp*error does not hold here, so the premise of "
           "this test is gone. Go back to the electrical and communication side "
           "and leave the mechanism alone."),
@@ -407,9 +476,16 @@ def d9_3_letter(result, torque_verdict):
     return result.letter
 
 
-def report_probe(motor_id, rows, kp_cmd, result):
+def report_probe(motor_id, rows, kp_cmd, result, requested_delta_rad=None):
     """Print the four D9-3 lines and return the scored letter."""
     increments = int(round(BREAKAWAY_MIN_DEG / FEEDBACK_POSITION_LSB_DEG))
+    if requested_delta_rad is not None:
+        direction = probe_direction(requested_delta_rad)
+        print(
+            f"PROBE DIRECTION: 0x{motor_id:02X} "
+            f"{np.rad2deg(requested_delta_rad):+.2f}deg "
+            f"({direction_label(direction)}); this run judges that side only."
+        )
     print(
         f"STATIC PROBE: 0x{motor_id:02X} net sustained movement="
         f"{np.rad2deg(result.net_rad):+.3f}deg toward the target "
@@ -612,7 +688,8 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
         # stale feedback, origin, stall guard) raises out of this run.
         result = probe_result(rows, start[selected_index],
                               np.deg2rad(target_delta_deg))
-        return report_probe(motor_id, rows, wire_kp, result)
+        return report_probe(motor_id, rows, wire_kp, result,
+                            np.deg2rad(target_delta_deg))
     finally:
         if bus_opened:
             try:
@@ -844,18 +921,20 @@ def analyze_csv(csv_path):
     if rows[0][1].startswith("probe"):
         result = probe_result(rows, initial_position,
                               initial_target - initial_position)
-        letter = report_probe(motor_id, rows, kp_cmd, result)
-        ceiling = probe_ceiling_current_a(kp_cmd, initial_target - initial_position)
+        requested_delta = initial_target - initial_position
+        letter = report_probe(motor_id, rows, kp_cmd, result, requested_delta)
+        ceiling = probe_ceiling_current_a(kp_cmd, requested_delta)
         print(
             f"PROBE CEILING: this run could only prove motion for a breakaway "
             f"current below {ceiling:.2f}A (commanded)."
         )
-        known = DEMONSTRATED_STALL_CURRENT_A.get(motor_id)
+        known = demonstrated_stall_current_a(motor_id, requested_delta)
         if letter == "C" and known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
             print(
                 f"CAVEAT: that ceiling is at or below {known:.2f}A, which this axis "
-                "has already held without moving, so this run's C repeats a known "
-                "result instead of adding one."
+                f"has already held without moving in the "
+                f"{direction_label(probe_direction(requested_delta))} direction, so "
+                "this run's C repeats a known result instead of adding one."
             )
         return D9_3_EXIT_CODE[letter]
     movement, max_current, required, verdict = policy_ramp_summary(

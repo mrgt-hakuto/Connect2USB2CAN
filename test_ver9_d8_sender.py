@@ -92,12 +92,11 @@ class ProbeAngleLimitTests(unittest.TestCase):
             places=6,
         )
 
-    def test_d9_3_cannot_be_repeated_now_that_0x1c_held_0_86a(self):
-        # D9-3 itself raised the demonstrated stall current, so the same run
-        # can no longer produce new information and must be refused.
-        self.assertAlmostEqual(sender.DEMONSTRATED_STALL_CURRENT_A[0x1C], 0.86)
-        with self.assertRaisesRegex(RuntimeError, "repeat-probe abort"):
-            sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
+    def test_no_axis_is_currently_recorded_as_stalled(self):
+        # D9-6 broke 0x1C away at 0.90 A, so the record that refused a repeat
+        # is gone.  The guard itself is still tested below with a fake entry.
+        self.assertEqual(sender.DEMONSTRATED_STALL_CURRENT_A, {})
+        sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
 
 
 class StallGuardTests(unittest.TestCase):
@@ -115,13 +114,70 @@ class StallGuardTests(unittest.TestCase):
         )
 
     def test_repeat_of_a_known_stall_is_refused_before_any_send(self):
-        with self.assertRaisesRegex(RuntimeError, "repeat-probe abort"):
-            sender.stall_guard(0x1C, 7.937, np.deg2rad(-4.524))
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            with self.assertRaisesRegex(RuntimeError, "repeat-probe abort"):
+                sender.stall_guard(0x1C, 7.937, np.deg2rad(-4.524))
 
     def test_guard_passes_an_axis_with_no_recorded_stall(self):
         ceiling, detail = sender.stall_guard(0x13, 7.937, np.deg2rad(-4.524))
         self.assertGreater(ceiling, 0.0)
         self.assertIn("probe ceiling", detail)
+
+
+class DirectionalStallRecordTests(unittest.TestCase):
+    """D9-4: a stall is evidence about one axis in one direction only.
+
+    D9-3 drove 0x1C only to -6.50 deg, which for LL_HR is toe-inward, toward
+    the other foot -- and the two feet were found touching.  The untested
+    positive side is new information, so the guard must not refuse it.
+    """
+
+    def test_recorded_stall_is_keyed_by_motor_and_direction(self):
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            self.assertEqual(
+                set(sender.DEMONSTRATED_STALL_CURRENT_A), {(0x1C, -1)}
+            )
+
+    def test_direction_sign_of_a_probe(self):
+        self.assertEqual(sender.probe_direction(np.deg2rad(-6.5)), -1)
+        self.assertEqual(sender.probe_direction(np.deg2rad(6.5)), 1)
+
+    def test_lookup_only_matches_the_probed_direction(self):
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            self.assertAlmostEqual(
+                sender.demonstrated_stall_current_a(0x1C, np.deg2rad(-6.5)), 0.86
+            )
+            self.assertIsNone(
+                sender.demonstrated_stall_current_a(0x1C, np.deg2rad(6.5))
+            )
+            self.assertIsNone(
+                sender.demonstrated_stall_current_a(0x13, np.deg2rad(-6.5))
+            )
+
+    def test_opposite_direction_probe_is_allowed(self):
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            ceiling, detail = sender.stall_guard(0x1C, 7.937, np.deg2rad(6.5))
+        self.assertGreater(ceiling, 0.86)
+        self.assertIn("probe ceiling", detail)
+
+    def test_same_direction_probe_is_still_refused_and_names_the_side(self):
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            with self.assertRaisesRegex(RuntimeError, "negative direction"):
+                sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
+
+    def test_refusal_points_at_the_unprobed_direction(self):
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}):
+            with self.assertRaisesRegex(
+                RuntimeError, "positive direction has not been probed"
+            ):
+                sender.stall_guard(0x1C, 7.937, np.deg2rad(-6.5))
+
+    def test_probe_angle_limit_is_unchanged_by_this_patch(self):
+        # The current abort and the noise margin still bound the angle; the
+        # directional record must not become a way to ask for a bigger one.
+        self.assertAlmostEqual(
+            sender.max_probe_angle_deg(7.937), 6.643, places=2
+        )
 
 
 class SenderCleanupTests(unittest.TestCase):
@@ -195,8 +251,10 @@ class ProbeScoringTests(unittest.TestCase):
             self._rows(positions, currents), np.deg2rad(-0.4), np.deg2rad(-6.5)
         )
         self.assertEqual(result.letter, "B")
-        # The first sample past the 0.5 deg floor was reading 0.55 A.
-        self.assertAlmostEqual(result.breakaway_current_a, 0.55, places=2)
+        # The current it was HOLDING just before it let go, not the current at
+        # the first moved sample: by then the error, and so the current, is
+        # already collapsing as the axis runs toward the target.
+        self.assertAlmostEqual(result.breakaway_current_a, 0.30, places=2)
 
     def test_covering_half_the_request_is_a(self):
         positions = [-0.4, -2.0, -3.9, -3.9, -3.9]
@@ -328,7 +386,8 @@ class SenderCleanupTests2(unittest.TestCase):
             "--probe-target-deg", "-6.5", "--ramp-seconds", "8", "--duration", "2",
             "--csv", "out.csv",
         ]
-        with patch.object(sys, "argv", argv), \
+        with patch.dict(sender.DEMONSTRATED_STALL_CURRENT_A, {(0x1C, -1): 0.86}), \
+                patch.object(sys, "argv", argv), \
                 patch.object(sender, "run_static_probe") as probe, \
                 patch.object(sender, "DualBus") as bus:
             with self.assertRaises(SystemExit):
@@ -536,3 +595,49 @@ class SenderCleanupTests2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LateBreakawayTests(unittest.TestCase):
+    """D9-6: an axis that lets go in the last second of the hold moved.
+
+    All three D9-6 runs broke away near the end of the hold and then ran
+    toward the target while the current collapsed.  A median over the whole
+    hold sits on the stationary part before that and scored 0x1C's real
+    3.5 deg move as 0.2 deg of dither.
+    """
+
+    def _rows(self, positions, currents, hold_from=0):
+        return [
+            (index * 0.02,
+             "probe-hold" if index >= hold_from else "probe-ramp",
+             "0x1C", 0.0, 0.0, 0.0,
+             np.deg2rad(position), 0.0, current)
+            for index, (position, current) in enumerate(zip(positions, currents))
+        ]
+
+    def test_breakaway_in_the_final_quarter_of_the_hold_scores_as_motion(self):
+        # Eight samples stationary at 0.2 deg holding 0.87 A, then it lets go
+        # and runs to 3.5 deg while the current falls away.
+        positions = [0.2] * 8 + [0.5, 1.9, 2.7] + [3.5] * 5
+        currents = [0.87] * 8 + [0.31, 0.34, 0.07] + [0.13] * 5
+        result = sender.probe_result(
+            self._rows(positions, currents), 0.0, np.deg2rad(6.5)
+        )
+        self.assertAlmostEqual(np.rad2deg(result.net_rad), 3.5, places=1)
+        self.assertEqual(result.letter, "A")
+        self.assertAlmostEqual(result.breakaway_current_a, 0.87, places=2)
+
+    def test_genuine_dither_is_still_scored_c(self):
+        # D9-3: two increments, non-monotone, no run at the end.
+        positions = [-0.4, -0.5, -0.4, -0.5, -0.6, -0.6, -0.6, -0.6]
+        currents = [0.86] * 8
+        result = sender.probe_result(
+            self._rows(positions, currents), np.deg2rad(-0.4), np.deg2rad(-6.5)
+        )
+        self.assertAlmostEqual(np.rad2deg(result.net_rad), 0.2, places=1)
+        self.assertEqual(result.letter, "C")
+
+    def test_hold_tail_is_the_last_quarter_of_the_hold_stage(self):
+        rows = self._rows([0.0] * 12, [0.0] * 12, hold_from=4)
+        self.assertEqual(len(sender.held_rows(rows)), 8)
+        self.assertEqual(len(sender.hold_tail_rows(rows)), 2)
