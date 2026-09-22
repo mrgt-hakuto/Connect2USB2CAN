@@ -14,12 +14,13 @@ import numpy as np
 import cubemars as cm
 from motor_console_ver8_2 import f_mit, quantized_cmd
 from policy_integration import ACTION_SIZE, HPolicy
+from robot_joint_map import BY_ID as H_BINDING_BY_ID
 from ver9_integration import H_CAN_IDS, H_MODELS, evaluate_cycle
 from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSET_M, VelocityCommand, servo_feedback_to_h_units
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_ALLAXES_20260923_0100"
+BUILD_ID = "D10_3_AXISLOG_20260923_1200"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -28,6 +29,29 @@ OPEN_SETTLE_S = 2.0
 OPEN_RETRY_S = 1.5
 CURRENT_ABORT_A = 1.0
 SPEED_ABORT_RAD_S = np.deg2rad(100.0)
+# 2026-09-23, from the D10-2 post mortem (reports/2026-09-23_d10-2_result.md).
+# CURRENT_ABORT_A = 1.0 A was chosen for a ONE-AXIS probe on a machine where
+# nothing carried load, and it is BELOW this robot's own static gravity load,
+# so it cannot be used unchanged for a run that drives several axes at once:
+#   * at the URDF zero pose, hanging, each HAA axis needs 2.1 N*m = 1.7 A just
+#     to hold its own leg -- 1.7x the abort while the robot does nothing;
+#   * over the reachable set, HFE needs up to 3.85 N*m = 7.4 A.
+# All five D10-2 runs died inside the ramp for exactly this reason (every CSV
+# holds stage "ramp" only, 1.4-6.6 s of a 15 s ramp; policy never entered).
+# The table below is the worst-case static gravity current per axis, computed
+# from onshape_export/myrobot_dummy/robot_sim.urdf with the measured c_p,
+# times a 1.5 margin, rounded up.  It stays far below what the trained policy
+# is itself allowed to use (AK10-9 53 N*m = 42.1 A, AK80-9 13.5 N*m = 25.8 A),
+# so it is still a guard and not a licence.
+# It is OPT-IN: --gravity-limits has to be typed, it refuses without
+# --all-axes, and every one-axis path keeps CURRENT_ABORT_A untouched.
+GRAVITY_CURRENT_ABORT_A_BY_JOINT = {
+    "HR":   3.0,   # static worst case 2.45 N*m = 1.95 A (AK10-9)
+    "HAA":  6.0,   # static worst case 4.75 N*m = 3.78 A (AK10-9)
+    "HFE": 11.0,   # static worst case 3.85 N*m = 7.36 A (AK80-9)
+    "KFE":  3.0,   # static worst case 1.17 N*m = 0.93 A (AK10-9)
+    "FFE":  2.0,   # static worst case 0.10 N*m = 0.20 A (AK80-9)
+}
 # A D7 `o 0` is temporary across a power cycle.  Do not arm a policy when
 # feedback is plainly not in that freshly zeroed reference frame.
 ORIGIN_ABORT_RAD = np.deg2rad(45.0)
@@ -126,6 +150,50 @@ CD = {"AK80-9": .523, "AK10-9": 1.216}
 
 def gains():
     return tuple((float(STIFFNESS[i]/CP[m]), float(DAMPING[i]/CD[m])) for i,m in enumerate(H_MODELS))
+
+
+def joint_suffix(motor_id):
+    """HR / HAA / HFE / KFE / FFE for one registered CAN id."""
+    return H_BINDING_BY_ID[motor_id].name.split("_", 1)[1]
+
+
+def default_current_limits():
+    """The one-axis probe limit, unchanged, applied to every registered axis."""
+    return {mid: CURRENT_ABORT_A for mid in H_CAN_IDS}
+
+
+def gravity_current_limits():
+    """Per-axis limits that clear this robot's own static gravity load."""
+    return {mid: GRAVITY_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)]
+            for mid in H_CAN_IDS}
+
+
+def rows_for_axis(rows, motor_id):
+    """The CSV rows belonging to one axis of a multi-axis run."""
+    label = f"0x{motor_id:02X}"
+    return [row for row in rows if row[2] == label]
+
+
+def axis_rows(tick, stage, desired, requested, bus, motor_ids):
+    """One CSV row per DRIVEN axis, not just the first one.
+
+    D10-2 drove ten axes and logged one: 0x1C, which happens to be both the
+    first entry of H_CAN_IDS and the heaviest axis measured so far, and whose
+    first policy target sat inside its own 6.5 deg deadband.  The question the
+    judging table actually asks -- which axis failed to reach its target --
+    therefore had no evidence at all.  This costs ten rows per tick and
+    answers it.
+    """
+    out = []
+    for mid in motor_ids:
+        index = H_CAN_IDS.index(mid)
+        state = bus.state(mid)
+        position, velocity = servo_feedback_to_h_units(state.pos, state.spd)
+        _kp, _kd, wire_target, _vel, _tau = wire_command(mid, requested[index])
+        out.append((tick, stage, f"0x{mid:02X}", float(desired[index]),
+                    float(requested[index]), wire_target,
+                    position, velocity, state.cur))
+    return out
 
 def frames(targets, motor_ids=H_CAN_IDS):
     if len(targets) != ACTION_SIZE: raise ValueError("need ten targets")
@@ -507,10 +575,14 @@ def report_probe(motor_id, rows, kp_cmd, result, requested_delta_rad=None):
 
 class DualBus:
     """Both gs_usb channels plus a per-process route learned from feedback."""
-    def __init__(self):
+    def __init__(self, current_limits=None):
         self.bus_by_channel = {
             channel: cm.MotorBus(channel=channel) for channel in (0, 1)
         }
+        # Per-axis current abort.  The default is the unchanged one-axis limit
+        # on every axis; only --gravity-limits replaces it, and only for a run
+        # that has to carry the machine's own weight.
+        self.current_limit_a = dict(current_limits or default_current_limits())
         self.route_by_motor_id = {}
         # This is deliberately separate from a route: a failed receive-only
         # preflight must close the adapter without injecting MIT frames.
@@ -518,7 +590,11 @@ class DualBus:
         self.mit_motor_ids = set()
 
     def open(self):
-        for attempt in (1, 2):
+        # See d7_origin_console.OPEN_ATTEMPTS: libusb0's reset fails on the
+        # first open on this PC nearly every time, so two attempts left no
+        # spare.  A failed open has sent no CAN frame and releases both
+        # interfaces before the next try.
+        for attempt in (1, 2, 3):
             try:
                 for channel in (0, 1):
                     self.bus_by_channel[channel].open()
@@ -528,7 +604,7 @@ class DualBus:
                 # An open/reset failure has not armed MIT and must not emit a
                 # CAN frame.  Release both interfaces before the one retry.
                 self.close()
-                if attempt == 2:
+                if attempt == 3:
                     raise
                 print(f"USB open failed; retrying once after {OPEN_RETRY_S:.1f}s (no CAN sent)")
                 time.sleep(OPEN_RETRY_S)
@@ -606,15 +682,40 @@ class DualBus:
             p,v=servo_feedback_to_h_units(s.pos,s.spd)
             if abs(p) > ORIGIN_ABORT_RAD:
                 raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg; D7 o 0 is required")
-            if abs(s.cur)>CURRENT_ABORT_A or abs(v)>SPEED_ABORT_RAD_S:
+            limit = self.current_limit_a.get(mid, CURRENT_ABORT_A)
+            if abs(s.cur)>limit or abs(v)>SPEED_ABORT_RAD_S:
                 raise RuntimeError(
                     f"motion/current abort 0x{mid:02X} ch={channel}: "
-                    f"cur={s.cur:+.2f}A (limit ±{CURRENT_ABORT_A:.2f}A), "
+                    f"cur={s.cur:+.2f}A (limit ±{limit:.2f}A), "
                     f"speed={np.rad2deg(v):+.1f}deg/s (limit ±{np.rad2deg(SPEED_ABORT_RAD_S):.1f}deg/s), "
                     f"pos={np.rad2deg(p):+.1f}deg"
                 )
             out[mid]=MotorFeedback(mid,now,p,v)
         return out
+    def snapshot(self):
+        """Every axis's last received state, for the line after an abort.
+
+        A ten-axis run that stops names the axis that tripped and nothing
+        else.  D10-2 lost exactly that: one axis in the CSV, one number in the
+        abort line, and no way to see what the other nine were doing.  This
+        raises nothing and sends nothing.
+        """
+        out = []
+        for mid in H_CAN_IDS:
+            try:
+                state = self.route_by_motor_id[mid].state(mid)
+                channel = self.channel_for(mid)
+            except (KeyError, RuntimeError, StopIteration):
+                out.append((mid, None, None, None, None, None, None))
+                continue
+            if state is None:
+                out.append((mid, channel, None, None, None, None, None))
+                continue
+            position, velocity = servo_feedback_to_h_units(state.pos, state.spd)
+            out.append((mid, channel, position, velocity, state.cur, state.err,
+                        max(0.0, time.time() - state.t)))
+        return out
+
     def zero(self):
         if not self.route_by_motor_id or not self.mit_frames_sent:
             return
@@ -622,6 +723,57 @@ class DualBus:
             for fr in zero_frames(tuple(sorted(self.mit_motor_ids))):
                 self.send(fr)
             time.sleep(.01)
+
+def report_snapshot(snapshot, current_limits=None):
+    """Print the ten-axis state a run stopped in.  Sends nothing, raises nothing."""
+    limits = current_limits or default_current_limits()
+    print("AXIS SNAPSHOT (all ten axes at the moment the run stopped):")
+    for mid, channel, position, velocity, current, err, age in snapshot:
+        name = H_BINDING_BY_ID[mid].name
+        channel_text = "?" if channel is None else str(channel)
+        if position is None:
+            print(f"  0x{mid:02X} {name:7s} ch={channel_text} no state received")
+            continue
+        print(
+            f"  0x{mid:02X} {name:7s} ch={channel_text} "
+            f"pos={np.rad2deg(position):+8.2f}deg "
+            f"vel={np.rad2deg(velocity):+8.1f}deg/s "
+            f"cur={current:+6.2f}A (limit {limits.get(mid, CURRENT_ABORT_A):.2f}A) "
+            f"err={err} age={age:.3f}s"
+        )
+
+
+def report_all_axes(rows, initial_positions, initial_targets, motor_ids):
+    """Per-axis table: what each axis was asked for, and what it did.
+
+    This replaces the single-axis tracking verdict for a whole-body run.  A
+    ten-axis run judged on H_CAN_IDS[0] alone is judged on 0x1C, whose
+    deadband is the largest measured on this machine, so a pass/fail keyed to
+    it says nothing about the other nine.
+    """
+    print("PER-AXIS RESULT (commanded delta against feedback movement):")
+    verdicts = {}
+    for mid in motor_ids:
+        index = H_CAN_IDS.index(mid)
+        axis = rows_for_axis(rows, mid)
+        kp_cmd = wire_command(mid, 0.0)[0]
+        requested = initial_targets[index] - initial_positions[index]
+        movement, current, required, verdict = policy_ramp_summary(
+            axis, initial_positions[index], initial_targets[index]
+        )
+        deadband = deadband_lower_bound_rad(current, kp_cmd)
+        deadband_deg = float("nan") if deadband is None else np.rad2deg(deadband)
+        verdicts[mid] = verdict
+        print(
+            f"  0x{mid:02X} {H_BINDING_BY_ID[mid].name:7s} "
+            f"asked={np.rad2deg(requested):+7.2f}deg "
+            f"moved={np.rad2deg(movement):6.2f}deg "
+            f"(need >= {np.rad2deg(required):5.2f}deg) "
+            f"max|I|={current:5.2f}A "
+            f"deadband >= {deadband_deg:5.2f}deg; {verdict}"
+        )
+    return verdicts
+
 
 def preview():
     for i,(mid,model) in enumerate(zip(H_CAN_IDS,H_MODELS)):
@@ -713,8 +865,130 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
         except Exception as error:
             print(f"WARNING: CSV cleanup failed: {error}")
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS):
-    policy=HPolicy(package); bus=DualBus(); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
+def report_hold_pose(rows, start, motor_ids, current_limits):
+    """What each axis needed to hold itself, and how far it sagged doing it.
+
+    Under MIT position control |I| = Kp * error, so an axis commanded to stay
+    where it already is sags until Kp*error balances its gravity load.  The
+    steady state therefore gives two numbers per axis that nothing else in
+    this program can give: the current that axis needs to hold itself, and the
+    droop that current buys.  Both are read from the tail of the hold, not its
+    mean, for the reason recorded in hold_tail_rows().
+    """
+    print("HOLD POSE RESULT (current each axis needs to hold itself):")
+    worst = []
+    for mid in motor_ids:
+        index = H_CAN_IDS.index(mid)
+        axis = rows_for_axis(rows, mid)
+        name = H_BINDING_BY_ID[mid].name
+        limit = current_limits.get(mid, CURRENT_ABORT_A)
+        if not axis:
+            print(f"  0x{mid:02X} {name:7s} no samples")
+            continue
+        tail = hold_tail_rows(axis)
+        held = median([abs(row[8]) for row in tail])
+        peak = max(abs(row[8]) for row in axis)
+        droop = median([row[6] for row in tail]) - start[index]
+        torque = held * CP[H_MODELS[index]]
+        headroom = limit - peak
+        worst.append((headroom, mid))
+        print(
+            f"  0x{mid:02X} {name:7s} hold|I|={held:5.2f}A "
+            f"(peak {peak:5.2f}A, limit {limit:5.2f}A, headroom {headroom:+5.2f}A) "
+            f"= {torque:5.2f}N*m; droop={np.rad2deg(droop):+7.2f}deg"
+        )
+    if worst:
+        headroom, mid = min(worst)
+        print(
+            f"TIGHTEST AXIS: 0x{mid:02X} {H_BINDING_BY_ID[mid].name} with "
+            f"{headroom:+.2f}A of headroom. Set the next run's limits from this "
+            "table, not from an estimate."
+        )
+    return worst
+
+
+def run_hold_pose(csv_path, duration, motor_ids=H_CAN_IDS, current_limits=None):
+    """Hold every driven axis at the position it is ALREADY in, and measure.
+
+    No policy, no T265, no package, no ramp toward a new pose: each target is
+    the position that axis reports at t=0 and it never changes.  What the
+    machine then does is the measurement D10-2 was missing.  It cannot be
+    obtained from a walking run, because there a sagging axis and a policy
+    command are the same number.
+
+    Every existing gate stays active -- stale feedback, motor error, origin,
+    speed -- and the current gate is per axis (see current_limits).
+    """
+    current_limits = dict(current_limits or default_current_limits())
+    bus = DualBus(current_limits)
+    rows = []
+    bus_opened = False
+    try:
+        bus.open()
+        bus_opened = True
+        bus.discover_routes()
+        feedback = bus.feedback()
+        start = tuple(feedback[mid].position for mid in H_CAN_IDS)
+        print(
+            f"HOLD POSE active: {len(motor_ids)} axes; hold={duration:g}s; "
+            "target = the position each axis is already in; no policy, no T265."
+        )
+        print("Hold targets: " + ", ".join(
+            f"0x{mid:02X}={np.rad2deg(start[H_CAN_IDS.index(mid)]):+.1f}deg"
+            for mid in motor_ids
+        ))
+        print("Current aborts: " + ", ".join(
+            f"0x{mid:02X}={current_limits.get(mid, CURRENT_ABORT_A):.1f}A"
+            for mid in motor_ids
+        ))
+        start_time = time.monotonic()
+        next_tick = start_time
+        end_hold = start_time + duration
+        while True:
+            now = time.monotonic()
+            if now >= end_hold:
+                break
+            time.sleep(max(0.0, next_tick - now))
+            tick = time.monotonic()
+            bus.feedback()
+            for frame in frames(start, motor_ids):
+                bus.send(frame)
+            rows.extend(axis_rows(tick, "hold-pose", start, start, bus, motor_ids))
+            next_tick += PERIOD
+        print(f"HOLD POSE complete: CAN tx={bus.tx_count}.")
+        report_hold_pose(rows, start, motor_ids, current_limits)
+        return 0
+    finally:
+        if bus_opened:
+            try:
+                report_snapshot(bus.snapshot(), current_limits)
+            except Exception as error:
+                print(f"WARNING: axis snapshot failed: {error}")
+            try:
+                bus.zero()
+            except Exception as error:
+                print(f"WARNING: zero MIT cleanup failed: {error}")
+            try:
+                bus.close()
+            except Exception as error:
+                print(f"WARNING: CAN cleanup failed: {error}")
+        try:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with csv_path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow((
+                    "tick", "stage", "sent_motor_id", "desired_target_rad",
+                    "requested_target_rad", "wire_target_rad", "feedback_position_rad",
+                    "feedback_velocity_rad_s", "feedback_current_a",
+                ))
+                writer.writerows(rows)
+        except Exception as error:
+            print(f"WARNING: CSV cleanup failed: {error}")
+
+
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None):
+    current_limits = dict(current_limits or default_current_limits())
+    policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
     try:
         bus.open(); bus_opened=True; t265_start_attempted=True; t265.start(); deadline=time.monotonic()+5
@@ -796,12 +1070,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             bus.feedback()
             for fr in frames(ramped, motor_ids):
                 bus.send(fr)
-            state = bus.state(selected_id)
-            feedback_pos, feedback_vel = servo_feedback_to_h_units(state.pos, state.spd)
-            _kp, _kd, wire_target, _vel, _tau = wire_command(selected_id, ramped[selected_index])
-            rows.append((tick, "ramp", f"0x{selected_id:02X}",
-                         initial_targets[selected_index], ramped[selected_index], wire_target,
-                         feedback_pos, feedback_vel, state.cur))
+            rows.extend(axis_rows(tick, "ramp", initial_targets, ramped,
+                                  bus, motor_ids))
             progress = min(int(tick - ramp_start), int(ramp_seconds))
             if progress != last_ramp_progress:
                 print(
@@ -828,11 +1098,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             targets = list(out.joint_target_h_order)
             targets[selected_index] = commanded_target
             for fr in frames(targets, motor_ids): bus.send(fr)
-            state = bus.state(selected_id)
-            feedback_pos, feedback_vel = servo_feedback_to_h_units(state.pos, state.spd)
-            _kp, _kd, wire_target, _vel, _tau = wire_command(selected_id, commanded_target)
-            rows.append((tick, "policy", f"0x{selected_id:02X}", desired_target,
-                         commanded_target, wire_target, feedback_pos, feedback_vel, state.cur))
+            rows.extend(axis_rows(tick, "policy", out.joint_target_h_order,
+                                  targets, bus, motor_ids))
             progress = min(int(tick - (end - duration)), int(duration))
             if progress != last_policy_progress:
                 print(
@@ -843,8 +1110,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 )
                 last_policy_progress = progress
             last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
+        selected_rows = rows_for_axis(rows, selected_id)
         max_tracking_rad, max_current_a, required_tracking_rad, tracking_verdict = policy_ramp_summary(
-            rows, initial_positions[selected_index], initial_targets[selected_index]
+            selected_rows, initial_positions[selected_index], initial_targets[selected_index]
         )
         print(
             f"TRACKING: 0x{selected_id:02X} max feedback movement="
@@ -852,9 +1120,14 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"(required >= {np.rad2deg(required_tracking_rad):.3f}deg); "
             f"max |current|={max_current_a:.2f}A; {tracking_verdict}"
         )
-        torque_verdict = report_torque_path(selected_id, rows, wire_kp)
-        if max_tracking_rad < required_tracking_rad:
-            report_deadband(selected_id, wire_kp, sustained_current_a(rows), None)
+        torque_verdict = report_torque_path(selected_id, selected_rows, wire_kp)
+        if len(motor_ids) > 1:
+            # A whole-body run is not pass/fail on one axis.  Report all ten
+            # and let the judging table read the table, not a single verdict
+            # keyed to the axis with the largest measured deadband.
+            report_all_axes(rows, initial_positions, initial_targets, motor_ids)
+        elif max_tracking_rad < required_tracking_rad:
+            report_deadband(selected_id, wire_kp, sustained_current_a(selected_rows), None)
             tracking_verdict = f"{tracking_verdict}; {torque_verdict}"
             raise RuntimeError(
                 f"tracking abort 0x{selected_id:02X}: feedback moved only "
@@ -867,6 +1140,10 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         # Cleanup must never be skipped, including a stale-feedback or USB-open
         # failure.  Attempt all shutdown steps even if one of them fails.
         if bus_opened:
+            try:
+                report_snapshot(bus.snapshot(), current_limits)
+            except Exception as error:
+                print(f"WARNING: axis snapshot failed: {error}")
             try:
                 bus.zero()
             except Exception as error:
@@ -917,7 +1194,36 @@ def analyze_csv(csv_path):
         f"{stage}={sum(1 for row in rows if row[1] == stage)}"
         for stage in dict.fromkeys(row[1] for row in rows)
     )
-    print(f"ANALYZE {csv_path}: 0x{motor_id:02X}; {len(rows)} rows ({stages})")
+    logged_ids = [int(label, 16) for label in dict.fromkeys(row[2] for row in rows)]
+    print(f"ANALYZE {csv_path}: {len(logged_ids)} axis/axes "
+          f"({', '.join(f'0x{mid:02X}' for mid in logged_ids)}); "
+          f"{len(rows)} rows ({stages})")
+    ticks = sorted(set(row[0] for row in rows))
+    if ticks:
+        print(f"SPAN: {ticks[-1] - ticks[0]:.2f}s of wall time over "
+              f"{len(ticks)} ticks. Stages present: {stages}.")
+        if not any(row[1] in ("policy", "probe-hold", "hold-pose") for row in rows):
+            print(
+                "INCOMPLETE: this CSV holds ramp samples only. The run did not "
+                "reach its hold/policy stage, so it stopped early -- the CSV is "
+                "written from a finally block, so partial rows mean the run "
+                "raised or was interrupted. Read the screen log's last line "
+                "before judging anything else."
+            )
+    if len(logged_ids) > 1:
+        start = {}
+        target = {}
+        for mid in logged_ids:
+            axis = rows_for_axis(rows, mid)
+            start[mid] = axis[0][6]
+            target[mid] = axis[-1][3]
+        positions = tuple(start.get(mid, 0.0) for mid in H_CAN_IDS)
+        targets = tuple(target.get(mid, start.get(mid, 0.0)) for mid in H_CAN_IDS)
+        if rows[0][1] == "hold-pose":
+            report_hold_pose(rows, positions, logged_ids, default_current_limits())
+        else:
+            report_all_axes(rows, positions, targets, logged_ids)
+        return 0
     if rows[0][1].startswith("probe"):
         result = probe_result(rows, initial_position,
                               initial_target - initial_position)
@@ -958,13 +1264,52 @@ def main():
     p.add_argument('--static-probe', action='store_true', help='with --arm: one-axis fixed relative target; no policy/T265')
     p.add_argument('--probe-target-deg', type=float, help=f'fixed relative target for --static-probe; abs <= {STATIC_PROBE_MAX_DEG:g} deg and within the per-axis current-abort limit')
     p.add_argument('--all-axes', action='store_true', help='with --arm: drive all ten registered axes instead of one. Suspended robot only; every existing abort stays active')
+    p.add_argument('--hold-pose', action='store_true', help='with --arm --all-axes: freeze every target at the position that axis is already in and measure the current it needs to hold itself. No policy, no T265, no --package')
+    p.add_argument('--gravity-limits', action='store_true', help=f'per-axis current abort sized to this robot static gravity load instead of the flat {CURRENT_ABORT_A:.1f}A one-axis limit. Requires --all-axes. Needs explicit user approval: it RAISES the abort on load-bearing axes')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
-    current_mode = 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
+    current_mode = 'hold-pose' if a.hold_pose else 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
     print(f"ver9_d8_sender build={BUILD_ID}; mode={current_mode}")
     if a.analyze: return analyze_csv(a.analyze)
     if a.preview: preview(); return 0
     if not (a.arm or a.preflight): p.error('--arm is required for transmission; use --preflight for a receive-only live check')
+    if a.gravity_limits and not a.all_axes:
+        p.error('--gravity-limits is only for a whole-body run; pass --all-axes, '
+                'or leave the one-axis limit alone')
+    if a.gravity_limits and a.static_probe:
+        p.error('--gravity-limits must not be combined with --static-probe; a one-axis '
+                'probe carries no load and its limit is not the thing under test')
+    limits = gravity_current_limits() if a.gravity_limits else default_current_limits()
+    if a.gravity_limits:
+        print("GRAVITY LIMITS: per-axis current abort raised to " + ", ".join(
+            f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A"
+            for mid in H_CAN_IDS
+        ))
+        print(f"GRAVITY LIMITS: the flat {CURRENT_ABORT_A:.1f}A limit is below this "
+              "robot's own static gravity load (HAA needs 1.7A hanging at the zero "
+              "pose), which is why every D10-2 run died inside the ramp. These "
+              "values are still far under the trained policy's own effort limit "
+              "(AK10-9 42.1A, AK80-9 25.8A). Speed abort, stale feedback, motor "
+              "error and origin aborts are unchanged.")
+    if a.hold_pose:
+        if not a.arm or a.preflight:
+            p.error('--hold-pose requires --arm and cannot be combined with --preflight')
+        if not a.all_axes:
+            p.error('--hold-pose is the whole-body hold measurement; pass --all-axes')
+        if a.static_probe:
+            p.error('--hold-pose and --static-probe are different runs; pass one')
+        if a.motor_id:
+            p.error('--hold-pose drives every registered axis; do not also pass --motor-id')
+        if a.package:
+            p.error('--hold-pose runs no policy; do not pass --package')
+        if a.vx or a.vy or a.wz:
+            p.error('--hold-pose runs no policy, so a velocity command means nothing; '
+                    'leave --vx/--vy/--wz at zero')
+        if not a.csv or not 0 < a.duration <= 5:
+            p.error('--hold-pose requires --csv and 0<--duration<=5')
+        print(f"HOLD POSE: holding all {len(H_CAN_IDS)} registered axes at their "
+              "present position (suspended robot only). Every axis is logged.")
+        return run_hold_pose(a.csv, a.duration, H_CAN_IDS, limits)
     if a.static_probe:
         if not a.arm or a.preflight: p.error('--static-probe requires --arm and cannot be combined with --preflight')
         if not a.csv or not 0 < a.duration <= 5: p.error('--static-probe requires --csv and 0<--duration<=5')
@@ -1014,12 +1359,13 @@ def main():
         motor_ids = H_CAN_IDS
         print(f"ALL AXES: driving all {len(H_CAN_IDS)} registered axes "
               "(suspended robot only). Every abort stays active. "
-              f"Logged axis is 0x{H_CAN_IDS[0]:02X}.")
+              "All ten axes are logged to the CSV.")
     else:
         if not a.motor_id or len(a.motor_id) != 1 or a.motor_id[0] not in H_CAN_IDS:
             p.error('--arm requires exactly one registered --motor-id (for example, 0x1C), '
                     'or --all-axes for the whole-body step')
         motor_ids = tuple(a.motor_id)
     run(a.package, a.duration, a.csv, a.vx, a.vy, a.wz,
-        transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids)
+        transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids,
+        current_limits=limits)
 if __name__=='__main__': sys.exit(main() or 0)

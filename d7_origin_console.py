@@ -25,7 +25,13 @@ ZERO_WARN_DEG = 45.0
 # otherwise python-can can abandon a half-initialised GsUsbBus and print its
 # misleading "not properly shut down" warning before our no-send retry.
 OPEN_SETTLE_S = 2.0
-OPEN_ATTEMPTS = 2
+# 2026-09-23: libusb0's device reset fails on the FIRST open on this PC almost
+# every time ("could not reset device, win error 31"), so attempt 1 was being
+# spent as a matter of course and attempt 2 was the only one left.  That is no
+# margin at all: one extra flaky enumeration and D7 does not start.  Three
+# attempts keeps the same behaviour and restores a spare.  This path still
+# transmits nothing: a failed open closes both interfaces before retrying.
+OPEN_ATTEMPTS = 3
 OPEN_RETRY_S = 1.5
 
 

@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -480,6 +481,7 @@ class SenderCleanupTests2(unittest.TestCase):
                  for channel in (0, 1)}
         bus = sender.DualBus.__new__(sender.DualBus)
         bus.bus_by_channel = buses
+        bus.current_limit_a = sender.default_current_limits()
         bus.route_by_motor_id = {motor_id: buses[0] for motor_id in sender.H_CAN_IDS}
         with self.assertRaisesRegex(RuntimeError, r"0x1C ch=0: cur=\+1.25A"):
             bus.feedback()
@@ -488,9 +490,13 @@ class SenderCleanupTests2(unittest.TestCase):
         instances = {}
 
         class FakeBus:
-            def __init__(self):
+            def __init__(self, current_limits=None):
                 instances["bus"] = self
+                self.current_limit_a = dict(current_limits or {})
                 self.opened = self.zeroed = self.closed = False
+
+            def snapshot(self):
+                return []
 
             def open(self):
                 self.opened = True
@@ -545,9 +551,13 @@ class SenderCleanupTests2(unittest.TestCase):
         instances = {}
 
         class FakeBus:
-            def __init__(self):
+            def __init__(self, current_limits=None):
                 instances["bus"] = self
+                self.current_limit_a = dict(current_limits or {})
                 self.zero_called = self.closed = False
+
+            def snapshot(self):
+                return []
 
             def open(self):
                 return None
@@ -677,3 +687,236 @@ class AllAxesFlagTests(unittest.TestCase):
         with patch.object(sys, "argv", argv), patch.object(sender, "run") as run:
             sender.main()
         self.assertEqual(run.call_args.kwargs["motor_ids"], (0x1C,))
+
+
+class PerAxisLimitTests(unittest.TestCase):
+    """The current abort is per axis, and the default is unchanged."""
+
+    def test_default_limits_are_the_unchanged_one_axis_value(self):
+        limits = sender.default_current_limits()
+        self.assertEqual(set(limits), set(sender.H_CAN_IDS))
+        for value in limits.values():
+            self.assertEqual(value, sender.CURRENT_ABORT_A)
+
+    def test_gravity_limits_clear_the_measured_static_gravity_load(self):
+        # Worst-case static gravity current per axis, from
+        # onshape_export/myrobot_dummy/robot_sim.urdf with the measured c_p.
+        required_a = {"HR": 1.95, "HAA": 3.78, "HFE": 7.36, "KFE": 0.93, "FFE": 0.20}
+        limits = sender.gravity_current_limits()
+        for motor_id, limit in limits.items():
+            suffix = sender.joint_suffix(motor_id)
+            self.assertGreater(limit, required_a[suffix],
+                               f"0x{motor_id:02X} cannot hold itself up")
+
+    def test_gravity_limits_stay_far_below_the_trained_policy_effort_limit(self):
+        # AK10-9 53 N*m, AK80-9 13.5 N*m (H_eff13p5_2999/actuator_table.md).
+        effort_nm = {"AK10-9": 53.0, "AK80-9": 13.5}
+        for index, motor_id in enumerate(sender.H_CAN_IDS):
+            model = sender.H_MODELS[index]
+            policy_current = effort_nm[model] / sender.CP[model]
+            self.assertLess(sender.gravity_current_limits()[motor_id],
+                            0.5 * policy_current,
+                            f"0x{motor_id:02X} limit is no longer a guard")
+
+    def test_feedback_uses_the_per_axis_limit_not_the_flat_one(self):
+        class State:
+            t = __import__("time").time()
+            err = 0
+            pos = spd = 0.0
+            cur = 5.0
+
+        buses = {channel: type("Bus", (), {"state": lambda _self, _mid: State()})()
+                 for channel in (0, 1)}
+        bus = sender.DualBus.__new__(sender.DualBus)
+        bus.bus_by_channel = buses
+        bus.route_by_motor_id = {motor_id: buses[0] for motor_id in sender.H_CAN_IDS}
+        # 5.0 A trips the flat limit on every axis ...
+        bus.current_limit_a = sender.default_current_limits()
+        with self.assertRaisesRegex(RuntimeError, "motion/current abort"):
+            bus.feedback()
+        # ... and passes under the gravity table, whose smallest entry is above it
+        # for the axes that actually carry load.  HFE is the binding one.
+        bus.current_limit_a = {motor_id: 6.0 for motor_id in sender.H_CAN_IDS}
+        bus.feedback()
+
+
+class AxisLoggingTests(unittest.TestCase):
+    """A whole-body run logs every driven axis, not only H_CAN_IDS[0]."""
+
+    class FakeBus:
+        def __init__(self, current_limits=None):
+            self.current_limit_a = dict(current_limits or {})
+
+        def state(self, motor_id):
+            return SimpleNamespace(pos=1.0, spd=0.0, cur=0.25, err=0,
+                                   t=__import__("time").time())
+
+    def test_axis_rows_emits_one_row_per_driven_axis(self):
+        targets = tuple(0.01 * index for index in range(10))
+        rows = sender.axis_rows(1.0, "ramp", targets, targets, self.FakeBus(),
+                                sender.H_CAN_IDS)
+        self.assertEqual(len(rows), 10)
+        self.assertEqual([row[2] for row in rows],
+                         [f"0x{mid:02X}" for mid in sender.H_CAN_IDS])
+        self.assertTrue(all(row[1] == "ramp" for row in rows))
+
+    def test_axis_rows_follows_the_driven_set_when_one_axis_is_selected(self):
+        targets = tuple(0.0 for _ in range(10))
+        rows = sender.axis_rows(1.0, "ramp", targets, targets, self.FakeBus(),
+                                (0x2A,))
+        self.assertEqual([row[2] for row in rows], ["0x2A"])
+
+    def test_rows_for_axis_selects_only_that_axis(self):
+        targets = tuple(0.0 for _ in range(10))
+        rows = sender.axis_rows(1.0, "ramp", targets, targets, self.FakeBus(),
+                                sender.H_CAN_IDS)
+        self.assertEqual(len(sender.rows_for_axis(rows, 0x1C)), 1)
+        self.assertEqual(sender.rows_for_axis(rows, 0x1C)[0][2], "0x1C")
+
+
+class HoldPoseTests(unittest.TestCase):
+    """Hold-pose measures what each axis needs to hold itself."""
+
+    def test_report_hold_pose_names_the_tightest_axis(self):
+        rows = []
+        # 0x2A holds 0.9 A against a 1.0 A limit; everyone else holds 0.1 A.
+        for tick in range(40):
+            for motor_id in sender.H_CAN_IDS:
+                current = 0.9 if motor_id == 0x2A else 0.1
+                rows.append((0.02 * tick, "hold-pose", f"0x{motor_id:02X}",
+                             0.0, 0.0, 0.0, 0.0, 0.0, current))
+        worst = sender.report_hold_pose(rows, tuple(0.0 for _ in range(10)),
+                                        sender.H_CAN_IDS,
+                                        sender.default_current_limits())
+        self.assertEqual(min(worst)[1], 0x2A)
+
+    def test_hold_pose_requires_all_axes(self):
+        with patch.object(sys, "argv",
+                          ["ver9_d8_sender.py", "--arm", "--hold-pose",
+                           "--csv", "x.csv", "--duration", "2"]):
+            with self.assertRaises(SystemExit):
+                sender.main()
+
+    def test_hold_pose_refuses_a_velocity_command(self):
+        with patch.object(sys, "argv",
+                          ["ver9_d8_sender.py", "--arm", "--all-axes", "--hold-pose",
+                           "--csv", "x.csv", "--duration", "2", "--vx", "0.2"]):
+            with self.assertRaises(SystemExit):
+                sender.main()
+
+    def test_hold_pose_refuses_a_policy_package(self):
+        with patch.object(sys, "argv",
+                          ["ver9_d8_sender.py", "--arm", "--all-axes", "--hold-pose",
+                           "--csv", "x.csv", "--duration", "2", "--package", "p"]):
+            with self.assertRaises(SystemExit):
+                sender.main()
+
+
+class GravityLimitFlagTests(unittest.TestCase):
+    """--gravity-limits raises an abort, so it has to be typed deliberately."""
+
+    def test_gravity_limits_refuses_without_all_axes(self):
+        with patch.object(sys, "argv",
+                          ["ver9_d8_sender.py", "--arm", "--gravity-limits",
+                           "--motor-id", "0x1C", "--csv", "x.csv",
+                           "--duration", "2", "--ramp-seconds", "15",
+                           "--package", "p"]):
+            with self.assertRaises(SystemExit):
+                sender.main()
+
+    def test_gravity_limits_refuses_with_static_probe(self):
+        with patch.object(sys, "argv",
+                          ["ver9_d8_sender.py", "--arm", "--all-axes",
+                           "--gravity-limits", "--static-probe",
+                           "--probe-target-deg", "2", "--csv", "x.csv",
+                           "--duration", "2", "--ramp-seconds", "5"]):
+            with self.assertRaises(SystemExit):
+                sender.main()
+
+
+class IncompleteRunTests(unittest.TestCase):
+    """A CSV that holds ramp samples only says so, instead of being scored."""
+
+    def test_analyze_flags_a_ramp_only_multi_axis_csv(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ramp_only.csv"
+            with path.open("w", newline="", encoding="utf-8") as file:
+                file.write("tick,stage,sent_motor_id,desired_target_rad,"
+                           "requested_target_rad,wire_target_rad,"
+                           "feedback_position_rad,feedback_velocity_rad_s,"
+                           "feedback_current_a\n")
+                for tick in range(20):
+                    for motor_id in sender.H_CAN_IDS:
+                        file.write(f"{0.02 * tick},ramp,0x{motor_id:02X},"
+                                   "0.01,0.005,0.005,0.0,0.0,0.02\n")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                sender.analyze_csv(path)
+        printed = buffer.getvalue()
+        self.assertIn("INCOMPLETE", printed)
+        self.assertIn("PER-AXIS RESULT", printed)
+
+
+class HoldPoseRunTests(unittest.TestCase):
+    """run_hold_pose writes every axis and never sends a policy target."""
+
+    def test_hold_pose_writes_ten_axes_and_commands_only_the_start_pose(self):
+        import contextlib
+
+        sent = []
+
+        class FakeBus:
+            tx_count = 0
+
+            def __init__(self, current_limits=None):
+                self.current_limit_a = dict(current_limits or {})
+                self.zeroed = self.closed = False
+
+            def open(self):
+                return None
+
+            def discover_routes(self):
+                return None
+
+            def feedback(self):
+                return {motor_id: sender.MotorFeedback(motor_id, 0.0, 0.05, 0.0)
+                        for motor_id in sender.H_CAN_IDS}
+
+            def state(self, motor_id):
+                return SimpleNamespace(pos=2.8648, spd=0.0, cur=0.3, err=0,
+                                       t=__import__("time").time())
+
+            def send(self, frame):
+                sent.append(frame.arbitration_id & 255)
+
+            def snapshot(self):
+                return []
+
+            def zero(self):
+                self.zeroed = True
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hold.csv"
+            with patch.object(sender, "DualBus", FakeBus):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    sender.run_hold_pose(path, 0.15, sender.H_CAN_IDS,
+                                         sender.gravity_current_limits())
+            text = path.read_text(encoding="utf-8").splitlines()
+        self.assertIn("HOLD POSE RESULT", buffer.getvalue())
+        # Every tick writes one row per axis, and every axis appears.
+        body = text[1:]
+        self.assertTrue(body)
+        self.assertEqual(len(body) % len(sender.H_CAN_IDS), 0)
+        self.assertEqual({line.split(",")[2] for line in body},
+                         {f"0x{motor_id:02X}" for motor_id in sender.H_CAN_IDS})
+        self.assertTrue(all(line.split(",")[1] == "hold-pose" for line in body))
+        # The commanded target is the measured start position on every row,
+        # so nothing is asked to move anywhere.
+        self.assertEqual({line.split(",")[3] for line in body},
+                         {line.split(",")[4] for line in body})
+        self.assertEqual(set(sent), set(sender.H_CAN_IDS))
