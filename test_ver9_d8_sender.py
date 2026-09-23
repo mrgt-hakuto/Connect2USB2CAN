@@ -1907,3 +1907,136 @@ class SoftStopTests(unittest.TestCase):
         rows, _abort, text = self._abort_run(0.5, HotBus)
         self.assertIn("SOFT STOP ended early", text)
         self.assertFalse([r for r in rows if r["stage"] == "soft-stop"])
+
+
+class StartGateTests(unittest.TestCase):
+    """D10-13C (2026-09-23): start the policy only upright, loop timing, CSV names."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "5"]
+
+    class _TiltT265:
+        gravity = (0.0, 0.0, -1.0)
+
+        def __init__(self, _offset):
+            pass
+
+        def start(self):
+            return None
+
+        def latest(self):
+            return SimpleNamespace(projected_gravity=self.gravity, confidence=3,
+                                   acquired_monotonic_s=__import__("time").monotonic())
+
+        def close(self):
+            return None
+
+    def _main(self, argv):
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            sender.main()
+        return run.call_args.kwargs
+
+    def test_flags_reach_run_and_defaults_are_off(self):
+        kw = self._main(self._WALK)
+        self.assertIsNone(kw["start_gate_rad"])
+        self.assertFalse(kw["fine_timer"])
+        kw = self._main(self._WALK + ["--start-gate-deg", "5", "--fine-timer"])
+        self.assertAlmostEqual(kw["start_gate_rad"], np.deg2rad(5.0))
+        self.assertTrue(kw["fine_timer"])
+
+    def test_refusals(self):
+        floor = [a if a != "--walk-limits" else "--floor-limits" for a in self._WALK]
+        floor[floor.index("200")] = "60"
+        for argv in (self._WALK + ["--start-gate-deg", "1"], self._WALK + ["--start-gate-deg", "11"],
+                     floor + ["--start-gate-deg", "5"]):
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_tilt_sign_forward_is_positive(self):
+        pitch, roll = sender.tilt_deg(SimpleNamespace(projected_gravity=(0.1, 0.0, -0.995)))
+        self.assertGreater(pitch, 5.0)
+        self.assertAlmostEqual(roll, 0.0)
+        self.assertEqual(sender.tilt_deg(object()), (None, None))
+
+    def test_unique_csv_path_never_reuses_a_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "r.csv"
+            self.assertEqual(sender.unique_csv_path(path), path)
+            sender.obs_csv_path(path).write_text("x")          # only the sidecar survived
+            self.assertEqual(sender.unique_csv_path(path).name, "r_2.csv")
+            (Path(directory) / "r_2.csv").write_text("x")
+            self.assertEqual(sender.unique_csv_path(path).name, "r_3.csv")
+
+    def test_main_renames_a_used_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            used = Path(directory) / "w.csv"
+            used.write_text("x")
+            argv = [a if a != "x.csv" else str(used) for a in self._WALK]
+            kw_args = None
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stdout", io.StringIO()):
+                sender.main()
+                kw_args = run.call_args.args
+            self.assertEqual(Path(kw_args[2]).name, "w_2.csv")
+
+    def test_fine_timer_is_undone(self):
+        import time as _time
+        original = _time.monotonic
+        with patch("sys.stdout", io.StringIO()):
+            state = sender.enable_fine_timer()
+            self.assertIs(_time.monotonic, _time.perf_counter)
+            sender.disable_fine_timer(state)
+        self.assertIs(_time.monotonic, original)
+
+    def _gate_run(self, gravity, timeout=None):
+        import contextlib
+        import csv as _csv
+        first = SimpleNamespace(joint_target_h_order=sender.STAND_TARGET, action_raw=np.zeros(10))
+        t265 = type("T", (self._TiltT265,), {"gravity": gravity})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "g.csv"
+            buffer = io.StringIO()
+            patches = [patch.object(sender, "HPolicy"),
+                       patch.object(sender, "DualBus", AllAxesSlewTests._fake_bus(None, [])),
+                       patch.object(sender, "RealT265", t265),
+                       patch.object(sender, "evaluate_cycle",
+                                    side_effect=lambda *a, **k: (None, None, first, None)),
+                       patch.object(sender, "START_GATE_HOLD_S", 0.1)]
+            if timeout is not None:
+                patches.append(patch.object(sender, "START_GATE_TIMEOUT_S", timeout))
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                stack.enter_context(contextlib.redirect_stdout(buffer))
+                sender.run(Path(directory), 0.2, path, 0.0, 0.0, 0.0,
+                           transmit=True, ramp_seconds=0.05, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.walk_current_limits(),
+                           policy_slew_rad_s=np.deg2rad(200.0), stand_seconds=0.05,
+                           speed_abort_rad_s=np.deg2rad(400.0),
+                           start_gate_rad=np.deg2rad(5.0), fine_timer=True)
+            with path.open(encoding="utf-8") as handle:
+                rows = list(_csv.DictReader(handle))
+            with sender.timing_csv_path(path).open(encoding="utf-8") as handle:
+                timing = list(_csv.DictReader(handle))
+            abort = sender.abort_txt_path(path)
+            abort_text = abort.read_text(encoding="utf-8") if abort.exists() else ""
+        return rows, timing, abort_text, buffer.getvalue()
+
+    def test_upright_opens_the_gate(self):
+        rows, timing, abort, text = self._gate_run((0.0, 0.0, -1.0))
+        self.assertIn("START GATE open", text)
+        self.assertTrue([r for r in rows if r["stage"] == "policy"])
+        self.assertTrue([r for r in timing if r["stage"] == "stand-gate"])
+        self.assertTrue([r for r in timing if r["stage"] == "policy"])
+        self.assertIn("LOOP TIMING (policy)", text)
+        self.assertEqual(abort, "")
+
+    def test_leaning_back_times_out_without_a_policy(self):
+        rows, _timing, abort, text = self._gate_run((-0.4, 0.0, -0.92), timeout=0.3)
+        self.assertIn("START GATE timeout", text)
+        self.assertIn("BACK", text)
+        self.assertFalse([r for r in rows if r["stage"] == "policy"])
+        self.assertIn("START GATE timeout", abort)

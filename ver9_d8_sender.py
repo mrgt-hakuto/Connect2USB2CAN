@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13B_SOFTSTOP_20260923_1900"
+BUILD_ID = "D10_13C_STARTGATE_20260923_2130"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -167,6 +167,23 @@ COMMAND_DELAY_MAX_S = 5.0
 WALK_SPEED_ABORT_MAX_DPS = 400.0
 SOFT_STOP_MAX_S = 5.0
 SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort")
+# D10-13C (2026-09-23): the only long policy stage so far (7.4 s of stepping
+# in place, D10-13B 19:14) started with the body upright (pitch -1 deg).
+# Every run that started leaning back 14-26 deg ended within 0.7 s.  The sim
+# never starts an episode leaning back, so --start-gate-deg G keeps holding
+# the stand pose after --stand-seconds until the T265 reads |pitch| and |roll|
+# <= G for START_GATE_HOLD_S, then starts the policy; no policy after
+# START_GATE_TIMEOUT_S.
+START_GATE_MIN_DEG = 2.0
+START_GATE_MAX_DEG = 10.0
+START_GATE_HOLD_S = 0.5
+START_GATE_TIMEOUT_S = 20.0
+START_GATE_PRINT_S = 0.5
+# D10-13C: Windows time.monotonic() (Python 3.10, GetTickCount64) and the
+# default 15.6 ms timer made the 50 Hz loop run at 0/16/31/47 ms steps.
+# --fine-timer switches the loop clock to perf_counter and asks Windows for a
+# 1 ms timer for the duration of the run.
+TIMING_LATE_S = 0.025
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -1537,7 +1554,9 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False):
+    timer_state = enable_fine_timer() if fine_timer else None
+    timing_rows = []
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits)
     if speed_abort_rad_s is not None:
@@ -1707,6 +1726,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 new_rows = axis_rows(tick, "stand-hold", hold_target, hold_target,
                                      bus, motor_ids)
                 rows.extend(new_rows)
+                timing_rows.append(timing_row(tick, "stand-hold",
+                                              timing_rows[-1][0] if timing_rows else None,
+                                              t265.latest()))
                 if stand_seconds > STAND_MAX_SECONDS:
                     window.extend(new_rows)
                     if tick >= next_progress:
@@ -1735,6 +1757,50 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             if stand_only:
                 print("STAND ONLY: no policy stage. Sending zero MIT cleanup.")
                 return
+            if start_gate_rad:
+                gate_deg = float(np.rad2deg(start_gate_rad))
+                print(f"START GATE: the policy starts once |pitch| and |roll| <= {gate_deg:g}deg "
+                      f"for {START_GATE_HOLD_S:g}s (timeout {START_GATE_TIMEOUT_S:g}s). "
+                      "Hold the body upright by hand or rope, then let go.")
+                gate_start = time.monotonic()
+                gate_next = gate_start
+                next_print = gate_start
+                upright_since = None
+                opened = False
+                while True:
+                    time.sleep(max(0, gate_next - time.monotonic()))
+                    tick = time.monotonic()
+                    bus.feedback()
+                    for fr in frames(stand_target, motor_ids):
+                        bus.send(fr)
+                    rows.extend(axis_rows(tick, "stand-gate", stand_target, stand_target,
+                                          bus, motor_ids))
+                    sample = t265.latest()
+                    timing_rows.append(timing_row(tick, "stand-gate",
+                                                  timing_rows[-1][0] if timing_rows else None, sample))
+                    pitch, roll = tilt_deg(sample)
+                    upright = (pitch is not None and abs(pitch) <= gate_deg and abs(roll) <= gate_deg)
+                    upright_since = (upright_since if upright_since is not None else tick) if upright else None
+                    if upright_since is not None and tick - upright_since >= START_GATE_HOLD_S:
+                        opened = True
+                        break
+                    if tick >= next_print:
+                        if pitch is None:
+                            print("START GATE: no T265 tilt yet")
+                        else:
+                            print(f"START GATE: pitch {pitch:+.1f}deg ({'forward' if pitch >= 0 else 'BACK'}) "
+                                  f"roll {roll:+.1f}deg -> {'upright' if upright else 'not upright'}")
+                        next_print += START_GATE_PRINT_S
+                    if tick - gate_start >= START_GATE_TIMEOUT_S:
+                        break
+                    gate_next += PERIOD
+                if not opened:
+                    abort_message = "START GATE timeout: never upright; no policy stage"
+                    print(f"START GATE timeout after {START_GATE_TIMEOUT_S:g}s: the body never stayed "
+                          "upright. No policy stage; sending zero MIT cleanup.")
+                    return
+                print(f"START GATE open after {tick - gate_start:.1f}s: pitch {pitch:+.1f}deg, "
+                      f"roll {roll:+.1f}deg. Policy starts now.")
             # The sim starts every episode with a zero previous action; the
             # action computed at the closed-leg start pose is stale by now.
             last = np.zeros(ACTION_SIZE, np.float32)
@@ -1759,7 +1825,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                     print(f"COMMAND: vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f} from now "
                           f"({tick - policy_start:.2f}s into the policy stage).")
                     command_started = True
-                _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),use_cmd.sample(tick),last)
+                t265_sample = t265.latest()
+                timing_rows.append(timing_row(tick, "policy",
+                                              timing_rows[-1][0] if timing_rows and timing_rows[-1][1] == "policy" else None,
+                                              t265_sample))
+                _s,_o,out,plan=evaluate_cycle(policy,t265_sample,bus.feedback(),use_cmd.sample(tick),last)
                 if _o is not None:
                     obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
                 desired_target = out.joint_target_h_order[selected_index]
@@ -1791,7 +1861,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             if soft_stop_s and is_soft_stop_abort(error):
                 print(f"ABORT in the policy stage: {error}")
                 abort_message = f"{type(error).__name__}: {error}"
-                soft_stop(bus, rows, motor_ids, current_limits, soft_stop_s)
+                abort_message += " | " + soft_stop(bus, rows, motor_ids, current_limits, soft_stop_s)
             raise
         selected_rows = rows_for_axis(rows, selected_id)
         max_tracking_rad, max_current_a, required_tracking_rad, tracking_verdict = policy_ramp_summary(
@@ -1835,6 +1905,16 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                                 encoding="utf-8")
             except Exception as error:
                 print(f"WARNING: abort record failed: {error}")
+        try:
+            report_timing(timing_rows, "policy")
+        except Exception as error:
+            print(f"WARNING: loop timing report failed: {error}")
+        try:
+            if timing_rows and csv_path is not None:
+                write_timing_csv(timing_csv_path(csv_path), timing_rows)
+        except Exception as error:
+            print(f"WARNING: timing CSV failed: {error}")
+        disable_fine_timer(timer_state)
         if policy_slew_rad_s is not None and any(row[1] == "policy" for row in rows):
             try:
                 report_slew_gap(rows, motor_ids)
@@ -1886,6 +1966,116 @@ OBS_JOINT_NAMES = ("LL_HR", "LR_HR", "LL_HAA", "LR_HAA", "LL_HFE", "LR_HFE",
                    "LL_KFE", "LR_KFE", "LL_FFE", "LR_FFE")
 
 
+def timing_csv_path(csv_path):
+    """Loop timing and T265 tilt per tick (D10-13C)."""
+    csv_path = Path(csv_path)
+    return csv_path.with_name(csv_path.stem + "_timing.csv")
+
+
+TIMING_HEADER = ("tick", "stage", "loop_dt_s", "t265_age_s", "t265_confidence",
+                 "gravity_x", "gravity_y", "gravity_z", "pitch_fwd_deg", "roll_deg")
+
+
+def tilt_deg(sample):
+    """(pitch forward +, roll) in degrees from a T265 sample, or (None, None)."""
+    gravity = getattr(sample, "projected_gravity", None)
+    if gravity is None:
+        return None, None
+    gx, gy, gz = (float(v) for v in gravity)
+    return float(np.rad2deg(np.arctan2(gx, -gz))), float(np.rad2deg(np.arctan2(gy, -gz)))
+
+
+def timing_row(tick, stage, previous_tick, sample):
+    gravity = getattr(sample, "projected_gravity", None)
+    acquired = getattr(sample, "acquired_monotonic_s", None)
+    pitch, roll = tilt_deg(sample)
+    nan = float("nan")
+    gx, gy, gz = (float(v) for v in gravity) if gravity is not None else (nan, nan, nan)
+    return (tick, stage, nan if previous_tick is None else tick - previous_tick,
+            nan if acquired is None else tick - float(acquired),
+            getattr(sample, "confidence", ""), gx, gy, gz,
+            nan if pitch is None else pitch, nan if roll is None else roll)
+
+
+def write_timing_csv(path, timing_rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(TIMING_HEADER)
+        writer.writerows(timing_rows)
+
+
+def report_timing(timing_rows, stage="policy"):
+    """Loop period and T265 sample age of one stage.  Sends nothing."""
+    dts = np.array([float(r[2]) for r in timing_rows if r[1] == stage and np.isfinite(float(r[2]))])
+    ages = np.array([float(r[3]) for r in timing_rows if r[1] == stage and np.isfinite(float(r[3]))])
+    if not len(dts):
+        return None
+    late = int(np.sum(dts > TIMING_LATE_S))
+    early = int(np.sum(dts < 0.010))
+    text = (f"LOOP TIMING ({stage}): {len(dts) + 1} ticks, dt median {np.median(dts) * 1e3:.1f}ms "
+            f"p95 {np.percentile(dts, 95) * 1e3:.1f}ms max {dts.max() * 1e3:.1f}ms; "
+            f">{TIMING_LATE_S * 1e3:.0f}ms: {late}, <10ms: {early}")
+    if len(ages):
+        text += f"; T265 age median {np.median(ages) * 1e3:.1f}ms max {ages.max() * 1e3:.1f}ms"
+    print(text)
+    return float(np.median(dts))
+
+
+def report_timing_csv(path):
+    with path.open(newline="", encoding="utf-8") as file:
+        records = list(csv.reader(file))[1:]
+    stages = list(dict.fromkeys(r[1] for r in records))
+    for stage in stages:
+        report_timing(records, stage)
+    gate = [r for r in records if r[1] in ("stand-hold", "stand-gate")]
+    if gate:
+        last = gate[-1]
+        print(f"TILT at the policy switch: pitch {float(last[8]):+.1f}deg (+ = forward), "
+              f"roll {float(last[9]):+.1f}deg")
+
+
+def enable_fine_timer():
+    """perf_counter as the loop clock and a 1 ms Windows timer.  Returns the undo state."""
+    state = {"monotonic": time.monotonic, "winmm": False}
+    time.monotonic = time.perf_counter
+    try:
+        import ctypes
+        state["winmm"] = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+    except Exception:
+        state["winmm"] = False
+    print("FINE TIMER: loop clock = perf_counter; Windows 1 ms timer "
+          + ("on." if state["winmm"] else "not available (not Windows?)."))
+    return state
+
+
+def disable_fine_timer(state):
+    if not state:
+        return
+    time.monotonic = state["monotonic"]
+    if state["winmm"]:
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+
+
+def unique_csv_path(path):
+    """Never overwrite an earlier run: return path, or path_2, path_3, ... (D10-13C)."""
+    path = Path(path)
+    def taken(candidate):
+        return any(x.exists() for x in (candidate, obs_csv_path(candidate),
+                                         abort_txt_path(candidate), timing_csv_path(candidate)))
+    if not taken(path):
+        return path
+    for number in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{number}{path.suffix}")
+        if not taken(candidate):
+            return candidate
+    raise RuntimeError(f"no free CSV name next to {path}")
+
+
 def abort_txt_path(csv_path):
     """The one-line abort record that belongs to one run CSV (D10-13B)."""
     csv_path = Path(csv_path)
@@ -1904,16 +2094,17 @@ def is_soft_stop_abort(error):
 def soft_stop(bus, rows, motor_ids, current_limits, seconds):
     """Hold every driven axis where it stopped, with the stand-hold gains.
 
-    Returns True when the hold ran for the full time, False when it ended
-    early (stale feedback, motor error, current above the table).  Either
-    way the caller's cleanup sends zero MIT afterwards.
+    Returns the one-line outcome (complete, skipped or ended early and why);
+    the caller appends it to the abort record.  Either way the caller's
+    cleanup sends zero MIT afterwards.
     """
     targets = list(STAND_TARGET)
     for mid in motor_ids:
         state = bus.state(mid)
         if state is None or time.time() - state.t > STALE_S or state.err:
-            print(f"SOFT STOP skipped: 0x{mid:02X} has no fresh error-free feedback; zero MIT now.")
-            return False
+            reason = f"SOFT STOP skipped: 0x{mid:02X} has no fresh error-free feedback; zero MIT now."
+            print(reason)
+            return reason
         position, _velocity, _current = h_feedback(mid, state)
         targets[H_CAN_IDS.index(mid)] = position
     print(f"SOFT STOP: holding every axis where it stopped (stand-hold gains) for {seconds:g}s, "
@@ -1926,19 +2117,23 @@ def soft_stop(bus, rows, motor_ids, current_limits, seconds):
         for mid in motor_ids:
             state = bus.state(mid)
             if state is None or time.time() - state.t > STALE_S or state.err:
-                print(f"SOFT STOP ended early: 0x{mid:02X} stale feedback or motor error; zero MIT now.")
-                return False
+                reason = (f"SOFT STOP ended early after {tick - end + seconds:.2f}s: 0x{mid:02X} "
+                          "stale feedback or motor error; zero MIT now.")
+                print(reason)
+                return reason
             limit = current_limits.get(mid, CURRENT_ABORT_A)
             if abs(state.cur) > limit:
-                print(f"SOFT STOP ended early: 0x{mid:02X} cur={state.cur:+.2f}A above "
-                      f"{limit:.2f}A; zero MIT now.")
-                return False
+                reason = (f"SOFT STOP ended early after {tick - end + seconds:.2f}s: 0x{mid:02X} "
+                          f"cur={state.cur:+.2f}A above {limit:.2f}A; zero MIT now.")
+                print(reason)
+                return reason
         for frame in frames(targets, motor_ids):
             bus.send(frame)
         rows.extend(axis_rows(tick, "soft-stop", targets, targets, bus, motor_ids))
         next_tick += PERIOD
-    print(f"SOFT STOP complete after {seconds:g}s.")
-    return True
+    reason = f"SOFT STOP complete after {seconds:g}s."
+    print(reason)
+    return reason
 
 
 def obs_csv_path(csv_path):
@@ -2031,6 +2226,9 @@ def analyze_csv(csv_path):
     kp_cmd = wire_command(motor_id, rows[0][5])[0]
     initial_position = rows[0][6]
     initial_target = rows[0][3]
+    timing_path = timing_csv_path(csv_path)
+    if timing_path.exists():
+        report_timing_csv(timing_path)
     abort_path = abort_txt_path(csv_path)
     if abort_path.exists():
         print(f"ABORT RECORD ({abort_path.name}): {abort_path.read_text(encoding='utf-8').strip()}")
@@ -2150,6 +2348,8 @@ def main():
     p.add_argument('--walk-limits', action='store_true', help=f'D10-12, policy on the floor with the hoist rope attached: --floor-limits with KFE/FFE {WALK_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} A, speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} deg/s, --policy-slew-dps allowed up to {WALK_POLICY_SLEW_MAX_DPS:g}. Needs explicit user approval')
     p.add_argument('--walk-speed-abort-dps', type=float, help=f'D10-13B, with --walk-limits: speed abort in deg/s ({np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}; default {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}). Needs explicit user approval')
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
+    p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
+    p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
@@ -2190,6 +2390,11 @@ def main():
         if not walk_speed_dps <= a.walk_speed_abort_dps <= WALK_SPEED_ABORT_MAX_DPS:
             p.error(f'--walk-speed-abort-dps must satisfy {walk_speed_dps:.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}')
         walk_speed_dps = float(a.walk_speed_abort_dps)
+    if a.start_gate_deg is not None:
+        if not a.walk_limits:
+            p.error('--start-gate-deg is for the floor walking run: pass --walk-limits')
+        if not START_GATE_MIN_DEG <= a.start_gate_deg <= START_GATE_MAX_DEG:
+            p.error(f'--start-gate-deg must satisfy {START_GATE_MIN_DEG:g} <= value <= {START_GATE_MAX_DEG:g}')
     if a.soft_stop_seconds is not None and not 0 < a.soft_stop_seconds <= SOFT_STOP_MAX_S:
         p.error(f'--soft-stop-seconds must satisfy 0 < value <= {SOFT_STOP_MAX_S:g}')
     limits = (walk_current_limits() if a.walk_limits
@@ -2351,6 +2556,11 @@ def main():
                   "probe, and do not raise Kp, the target angle or the current abort.")
         return D9_3_EXIT_CODE[letter]
     if not a.package: p.error('--package is required')
+    if a.csv and (a.arm or a.preflight) and not a.analyze:
+        fresh = unique_csv_path(a.csv)
+        if fresh != Path(a.csv):
+            print(f"CSV NAME: {a.csv} is already used; this run writes {fresh} instead.")
+        a.csv = fresh
     if a.preflight:
         # A path is still supplied so evidence is written consistently, but
         # no policy frame or cleanup frame is put on CAN.
@@ -2394,5 +2604,7 @@ def main():
         auto_lean_rad=auto_lean_rad,
         speed_abort_rad_s=float(np.deg2rad(walk_speed_dps)) if a.walk_limits else None,
         command_delay_s=a.command_delay_seconds,
-        soft_stop_s=a.soft_stop_seconds)
+        soft_stop_s=a.soft_stop_seconds,
+        start_gate_rad=None if a.start_gate_deg is None else float(np.deg2rad(a.start_gate_deg)),
+        fine_timer=a.fine_timer)
 if __name__=='__main__': sys.exit(main() or 0)
