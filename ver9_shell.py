@@ -20,6 +20,8 @@ from typing import Dict, Iterable, Optional, Protocol, Sequence
 
 import numpy as np
 
+from robot_joint_map import SIGN_BY_ID
+
 
 HZ = 50.0
 PERIOD_S = 1.0 / HZ
@@ -281,9 +283,16 @@ class RealT265:
             self._pipe = None
 
 
-def servo_feedback_to_h_units(position_deg: float, velocity_erpm: float) -> tuple[float, float]:
-    """Convert verified Cubemars servo feedback units to the H contract."""
-    return math.radians(float(position_deg)), math.radians(float(velocity_erpm) / 31.5)
+def servo_feedback_to_h_units(position_deg: float, velocity_erpm: float, motor_id: int) -> tuple[float, float]:
+    """Convert verified Cubemars servo feedback units AND joint sign to the H contract.
+
+    motor_id is required on purpose (2026-09-23 D10-6): half the joints are
+    mounted opposite to the sim axis, so feedback without its joint sign is
+    in the wrong frame.
+    """
+    sign = SIGN_BY_ID[motor_id]
+    return (sign * math.radians(float(position_deg)),
+            sign * math.radians(float(velocity_erpm) / 31.5))
 
 
 class RealCan:
@@ -314,12 +323,8 @@ class RealCan:
             if state is not None:
                 # Servo feedback is output-shaft degrees and ERPM.  H's
                 # observation contract requires radians and radians/second.
-                result[can_id] = MotorFeedback(
-                    can_id,
-                    now,
-                    math.radians(float(state.pos)),
-                    math.radians(float(state.spd) / 31.5),
-                )
+                position, velocity = servo_feedback_to_h_units(state.pos, state.spd, can_id)
+                result[can_id] = MotorFeedback(can_id, now, position, velocity)
         self.tx_count = int(self._bus.tx_count)
         return result
 

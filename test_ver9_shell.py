@@ -61,9 +61,29 @@ class Ver9ShellTests(unittest.TestCase):
         np.testing.assert_allclose(velocity, np.array([-0.08900, 0.06345, 0.0]))
 
     def test_servo_feedback_units_convert_to_h_radians(self):
-        position, velocity = ver9_shell.servo_feedback_to_h_units(180.0, 31.5)
+        position, velocity = ver9_shell.servo_feedback_to_h_units(180.0, 31.5, 0x1C)
         self.assertAlmostEqual(position, np.pi)
         self.assertAlmostEqual(velocity, np.pi / 180.0)
+
+    def test_servo_feedback_applies_the_joint_sign(self):
+        # 0x2A LR_HFE is sign -1 (D10-6): motor +180 deg is H -pi.
+        position, velocity = ver9_shell.servo_feedback_to_h_units(180.0, 31.5, 0x2A)
+        self.assertAlmostEqual(position, -np.pi)
+        self.assertAlmostEqual(velocity, -np.pi / 180.0)
+
+    def test_real_can_latest_reports_h_frame(self):
+        can = ver9_shell.RealCan(0, 1000000)
+        states = {0x2A: type("S", (), {"pos": 20.0, "spd": 0.0})(),
+                  0x21: type("S", (), {"pos": 20.0, "spd": 0.0})()}
+        can._bus = type("B", (), {"rx_error": None, "tx_count": 0,
+                                  "state": lambda self, mid: states.get(mid)})()
+        out = can.latest((0x2A, 0x21))
+        self.assertAlmostEqual(np.rad2deg(out[0x2A].position), -20.0)
+        self.assertAlmostEqual(np.rad2deg(out[0x21].position), 20.0)
+
+    def test_servo_feedback_refuses_without_a_motor_id(self):
+        with self.assertRaises(TypeError):
+            ver9_shell.servo_feedback_to_h_units(180.0, 31.5)
 
     def test_no_can_transmit_symbol_in_d2_source(self):
         source = MODULE_PATH.read_text(encoding="utf-8")

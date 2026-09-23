@@ -1219,3 +1219,44 @@ class StandPoseTests(unittest.TestCase):
             self.assertLess(abs(float(r["requested_target_rad"]) - sender.STAND_TARGET[index]),
                             np.deg2rad(20.0) * 0.2)
         self.assertIn("SLEW GAP", text)
+
+
+from motor_console_ver8_2 import unpack_mit
+
+
+class JointSignRoundTripTests(unittest.TestCase):
+    """D10-6 (2026-09-23): a sign -1 joint is flipped on BOTH sides of the wire."""
+
+    def test_h_plus_10_goes_out_as_motor_minus_10_and_comes_back(self):
+        mid = 0x2A  # LR_HFE, sign -1
+        index = sender.H_CAN_IDS.index(mid)
+        targets = [0.0] * 10
+        targets[index] = np.deg2rad(10.0)
+        (sent,) = sender.frames(targets, (mid,))
+        on_wire = unpack_mit(bytes(sent.data), "AK80-9")["pos"]
+        self.assertAlmostEqual(np.rad2deg(on_wire), -10.0, places=1)
+        wire = sender.wire_command(mid, np.deg2rad(10.0))[2]
+        self.assertAlmostEqual(np.rad2deg(wire), -10.0, places=1)
+        state = SimpleNamespace(pos=-10.0, spd=-31.5, cur=-0.5)
+        position, velocity, current = sender.h_feedback(mid, state)
+        self.assertAlmostEqual(np.rad2deg(position), 10.0)
+        self.assertAlmostEqual(velocity, np.deg2rad(1.0))
+        self.assertAlmostEqual(current, 0.5)
+
+    def test_plus_one_joint_is_unchanged(self):
+        mid = 0x21  # LL_HFE, sign +1
+        index = sender.H_CAN_IDS.index(mid)
+        targets = [0.0] * 10
+        targets[index] = np.deg2rad(10.0)
+        (sent,) = sender.frames(targets, (mid,))
+        on_wire = unpack_mit(bytes(sent.data), "AK80-9")["pos"]
+        self.assertAlmostEqual(np.rad2deg(on_wire), 10.0, places=1)
+        position, _v, _c = sender.h_feedback(mid, SimpleNamespace(pos=10.0, spd=0.0, cur=0.0))
+        self.assertAlmostEqual(np.rad2deg(position), 10.0)
+
+    def test_stand_pose_is_mirrored_on_the_wire_for_flipped_joints(self):
+        for mid in sender.H_CAN_IDS:
+            index = sender.H_CAN_IDS.index(mid)
+            wire = sender.wire_command(mid, sender.STAND_TARGET[index])[2]
+            sign = sender.H_BINDING_BY_ID[mid].sign
+            self.assertAlmostEqual(wire, sign * sender.STAND_TARGET[index], places=2)

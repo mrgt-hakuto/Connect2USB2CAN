@@ -14,13 +14,13 @@ import numpy as np
 import cubemars as cm
 from motor_console_ver8_2 import f_mit, quantized_cmd
 from policy_integration import ACTION_SIZE, DEFAULT_JOINT_POS, HPolicy
-from robot_joint_map import BY_ID as H_BINDING_BY_ID
+from robot_joint_map import BY_ID as H_BINDING_BY_ID, h_to_motor, motor_to_h
 from ver9_integration import H_CAN_IDS, H_MODELS, evaluate_cycle
 from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSET_M, VelocityCommand, servo_feedback_to_h_units
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_5_STANDPOSE_20260923_1300"
+BUILD_ID = "D10_6_JOINTSIGN_20260923_1340"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -173,6 +173,16 @@ def gains():
     return tuple((float(STIFFNESS[i]/CP[m]), float(DAMPING[i]/CD[m])) for i,m in enumerate(H_MODELS))
 
 
+def h_feedback(motor_id, state):
+    """(position rad, velocity rad/s, current A) of one servo state, in the H frame.
+
+    Every feedback quantity crosses the joint sign here (D10-6, 2026-09-23).
+    The current keeps its magnitude; only its sign follows the joint.
+    """
+    position, velocity = servo_feedback_to_h_units(state.pos, state.spd, motor_id)
+    return position, velocity, motor_to_h(motor_id, state.cur)
+
+
 def joint_suffix(motor_id):
     """HR / HAA / HFE / KFE / FFE for one registered CAN id."""
     return H_BINDING_BY_ID[motor_id].name.split("_", 1)[1]
@@ -257,11 +267,11 @@ def axis_rows(tick, stage, desired, requested, bus, motor_ids):
     for mid in motor_ids:
         index = H_CAN_IDS.index(mid)
         state = bus.state(mid)
-        position, velocity = servo_feedback_to_h_units(state.pos, state.spd)
+        position, velocity, current = h_feedback(mid, state)
         _kp, _kd, wire_target, _vel, _tau = wire_command(mid, requested[index])
         out.append((tick, stage, f"0x{mid:02X}", float(desired[index]),
                     float(requested[index]), wire_target,
-                    position, velocity, state.cur))
+                    position, velocity, current))
     return out
 
 def frames(targets, motor_ids=H_CAN_IDS):
@@ -271,7 +281,7 @@ def frames(targets, motor_ids=H_CAN_IDS):
         raise ValueError("motor_ids must be registered H CAN IDs")
     return tuple(
         f_mit(motor_id, *gains()[index_by_id[motor_id]],
-              float(targets[index_by_id[motor_id]]), 0., 0.,
+              h_to_motor(motor_id, targets[index_by_id[motor_id]]), 0., 0.,
               H_MODELS[index_by_id[motor_id]])
         for motor_id in motor_ids
     )
@@ -282,10 +292,14 @@ def zero_frames(motor_ids=H_CAN_IDS):
 
 
 def wire_command(motor_id, target_rad):
-    """Return the quantized MIT values, including the position on the wire."""
+    """Return the quantized MIT values, including the position on the wire.
+
+    target_rad is in the H frame; the returned position is in the MOTOR frame
+    (joint sign applied), exactly as frames() puts it on the bus.
+    """
     index = H_CAN_IDS.index(motor_id)
     kp, kd = gains()[index]
-    return quantized_cmd((kp, kd, float(target_rad), 0.0, 0.0), H_MODELS[index])
+    return quantized_cmd((kp, kd, h_to_motor(motor_id, target_rad), 0.0, 0.0), H_MODELS[index])
 
 
 def ramp_targets(start, target, elapsed_s, ramp_seconds):
@@ -472,8 +486,10 @@ def direction_label(direction):
 
 def demonstrated_stall_current_a(motor_id, requested_delta_rad):
     """|I| this axis has already held *on this side* without breaking away."""
+    # Keyed in the MOTOR frame (a stall is a fact about the motor); the
+    # probe's delta arrives in the H frame, so cross the joint sign here.
     return DEMONSTRATED_STALL_CURRENT_A.get(
-        (motor_id, probe_direction(requested_delta_rad))
+        (motor_id, probe_direction(h_to_motor(motor_id, requested_delta_rad)))
     )
 
 
@@ -491,7 +507,8 @@ def stall_guard(motor_id, kp_cmd, requested_delta_rad):
     )
     known = demonstrated_stall_current_a(motor_id, requested_delta_rad)
     if known is not None and ceiling <= known + STALL_GUARD_MARGIN_A:
-        opposite = DEMONSTRATED_STALL_CURRENT_A.get((motor_id, -direction))
+        motor_direction = probe_direction(h_to_motor(motor_id, requested_delta_rad))
+        opposite = DEMONSTRATED_STALL_CURRENT_A.get((motor_id, -motor_direction))
         hint = (
             ""
             if opposite is not None
@@ -748,7 +765,7 @@ class DualBus:
             if s is None or time.time()-s.t > STALE_S:
                 raise RuntimeError(f"stale feedback 0x{mid:02X} ch={channel}")
             if s.err: raise RuntimeError(f"motor error 0x{mid:02X} ch={channel}: {s.err}")
-            p,v=servo_feedback_to_h_units(s.pos,s.spd)
+            p,v=servo_feedback_to_h_units(s.pos,s.spd,mid)
             if abs(p) > ORIGIN_ABORT_RAD:
                 raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg; D7 o 0 is required")
             limit = self.current_limit_a.get(mid, CURRENT_ABORT_A)
@@ -780,8 +797,8 @@ class DualBus:
             if state is None:
                 out.append((mid, channel, None, None, None, None, None))
                 continue
-            position, velocity = servo_feedback_to_h_units(state.pos, state.spd)
-            out.append((mid, channel, position, velocity, state.cur, state.err,
+            position, velocity, current = h_feedback(mid, state)
+            out.append((mid, channel, position, velocity, current, state.err,
                         max(0.0, time.time() - state.t)))
         return out
 
@@ -898,11 +915,11 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
             for frame in frames(requested, (motor_id,)):
                 bus.send(frame)
             state = bus.state(motor_id)
-            feedback_pos, feedback_vel = servo_feedback_to_h_units(state.pos, state.spd)
+            feedback_pos, feedback_vel, feedback_cur = h_feedback(motor_id, state)
             _kp, _kd, wire_position, _vel, _tau = wire_command(motor_id, requested[selected_index])
             rows.append((tick, stage, f"0x{motor_id:02X}", target[selected_index],
                          requested[selected_index], wire_position, feedback_pos,
-                         feedback_vel, state.cur))
+                         feedback_vel, feedback_cur))
             next_tick += PERIOD
         # An axis that stays put is the measurement this probe exists to make,
         # so it is scored and reported.  Only a real abort (current, speed,
@@ -927,8 +944,8 @@ def run_static_probe(csv_path, motor_id, target_delta_deg, ramp_seconds, duratio
                 writer = csv.writer(file)
                 writer.writerow((
                     "tick", "stage", "sent_motor_id", "desired_target_rad",
-                    "requested_target_rad", "wire_target_rad", "feedback_position_rad",
-                    "feedback_velocity_rad_s", "feedback_current_a",
+                    "requested_target_rad", "wire_target_motor_rad", "feedback_position_rad",
+                    "feedback_velocity_rad_s", "feedback_current_h_a",
                 ))
                 writer.writerows(rows)
         except Exception as error:
@@ -1047,8 +1064,8 @@ def run_hold_pose(csv_path, duration, motor_ids=H_CAN_IDS, current_limits=None):
                 writer = csv.writer(file)
                 writer.writerow((
                     "tick", "stage", "sent_motor_id", "desired_target_rad",
-                    "requested_target_rad", "wire_target_rad", "feedback_position_rad",
-                    "feedback_velocity_rad_s", "feedback_current_a",
+                    "requested_target_rad", "wire_target_motor_rad", "feedback_position_rad",
+                    "feedback_velocity_rad_s", "feedback_current_h_a",
                 ))
                 writer.writerows(rows)
         except Exception as error:
@@ -1298,8 +1315,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 w=csv.writer(f)
                 w.writerow((
                     'tick', 'stage', 'sent_motor_id', 'desired_target_rad',
-                    'requested_target_rad', 'wire_target_rad', 'feedback_position_rad',
-                    'feedback_velocity_rad_s', 'feedback_current_a',
+                    'requested_target_rad', 'wire_target_motor_rad', 'feedback_position_rad',
+                    'feedback_velocity_rad_s', 'feedback_current_h_a',
                 ))
                 w.writerows(rows)
         except Exception as error:
@@ -1314,11 +1331,19 @@ def analyze_csv(csv_path):
     motor_id = int(records[0]["sent_motor_id"], 16)
     if motor_id not in H_CAN_IDS:
         raise RuntimeError(f"{csv_path} is not a registered H axis")
+    # CSVs written before D10-6 (build D10_5 and older) used the old column
+    # names and were recorded with every joint sign assumed +1, i.e. their
+    # H-frame columns are really motor-frame for the five sign -1 joints.
+    legacy = "wire_target_motor_rad" not in records[0]
+    if legacy:
+        print("NOTE: pre-D10-6 CSV: all joint signs were +1 when it was recorded.")
+    wire_key = "wire_target_rad" if legacy else "wire_target_motor_rad"
+    current_key = "feedback_current_a" if legacy else "feedback_current_h_a"
     rows = [(
         float(record["tick"]), record["stage"], record["sent_motor_id"],
         float(record["desired_target_rad"]), float(record["requested_target_rad"]),
-        float(record["wire_target_rad"]), float(record["feedback_position_rad"]),
-        float(record["feedback_velocity_rad_s"]), float(record["feedback_current_a"]),
+        float(record[wire_key]), float(record["feedback_position_rad"]),
+        float(record["feedback_velocity_rad_s"]), float(record[current_key]),
     ) for record in records]
     kp_cmd = wire_command(motor_id, rows[0][5])[0]
     initial_position = rows[0][6]
