@@ -13,14 +13,14 @@ import numpy as np
 
 import cubemars as cm
 from motor_console_ver8_2 import f_mit, quantized_cmd
-from policy_integration import ACTION_SIZE, HPolicy
+from policy_integration import ACTION_SIZE, DEFAULT_JOINT_POS, HPolicy
 from robot_joint_map import BY_ID as H_BINDING_BY_ID
 from ver9_integration import H_CAN_IDS, H_MODELS, evaluate_cycle
 from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSET_M, VelocityCommand, servo_feedback_to_h_units
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_4_ALLSLEW_20260923_1200"
+BUILD_ID = "D10_5_STANDPOSE_20260923_1300"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -69,6 +69,13 @@ POLICY_SLEW_MAX_DPS = 60.0
 # 0x2B toward -63.8 deg and died on the origin abort at -45.2 deg.
 ALL_AXES_MAX_TARGET_DEG = 40.0
 ALL_AXES_MAX_DELTA_DEG = 30.0
+# D10-4 (2026-09-23): starting the policy from the all-zero pose (knees
+# straight) and ramping to its first output put the policy outside what it
+# saw in training -- the sim resets near DEFAULT_JOINT_POS (x0.5-1.5) -- and
+# it asked for KFE up to +178 deg.  --stand-seconds ramps to the sim default
+# pose instead, holds it, and only then hands over to the slew-limited policy.
+STAND_MAX_SECONDS = 5.0
+STAND_TARGET = tuple(float(value) for value in DEFAULT_JOINT_POS)
 # A completed one-axis run is not evidence of position control if feedback
 # never departs its D7 origin by even one servo-feedback display increment.
 MIN_TRACKING_DEG = 0.1
@@ -1048,7 +1055,7 @@ def run_hold_pose(csv_path, duration, motor_ids=H_CAN_IDS, current_limits=None):
             print(f"WARNING: CSV cleanup failed: {error}")
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
@@ -1074,7 +1081,16 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             f"delta={np.rad2deg(target-position):+.1f}deg"
             for mid, target, position in zip(H_CAN_IDS, initial_targets, initial_positions)
         ))
-        violations = all_axes_prearm_violations(initial_targets, initial_positions)
+        # With a stand stage the open-loop ramp goes to the sim default pose,
+        # not to the policy's first output, so that is what the gate checks.
+        ramp_goal = STAND_TARGET if stand_seconds else tuple(initial_targets)
+        if stand_seconds:
+            print("STAND TARGET (sim default pose, no MIT sent yet): " + ", ".join(
+                f"0x{mid:02X} target={np.rad2deg(target):+.1f}deg "
+                f"delta={np.rad2deg(target-position):+.1f}deg"
+                for mid, target, position in zip(H_CAN_IDS, STAND_TARGET, initial_positions)
+            ))
+        violations = all_axes_prearm_violations(ramp_goal, initial_positions)
         if violations:
             print(f"ALL-AXES PRE-ARM GATE: would REFUSE a whole-body run "
                   f"(|target|>{ALL_AXES_MAX_TARGET_DEG:g}deg or |delta|>"
@@ -1086,7 +1102,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             print("PREFLIGHT complete: CAN transmit count is zero.")
             return
         if len(motor_ids) > 1:
-            if policy_slew_rad_s is None:
+            if policy_slew_rad_s is None and not stand_only:
                 raise RuntimeError("a whole-body policy run requires --policy-slew-dps; "
                                    "no MIT frame was sent")
             if violations:
@@ -1141,15 +1157,15 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 break
             time.sleep(max(0, ramp_next - time.monotonic()))
             tick = time.monotonic()
-            ramped = ramp_targets(initial_positions, initial_targets,
+            ramped = ramp_targets(initial_positions, ramp_goal,
                                   tick - ramp_start, ramp_seconds)
             # Re-read feedback before every frame batch.  The established
             # stale/error/current/speed gates remain active during the ramp.
             bus.feedback()
             for fr in frames(ramped, motor_ids):
                 bus.send(fr)
-            rows.extend(axis_rows(tick, "ramp", initial_targets, ramped,
-                                  bus, motor_ids))
+            rows.extend(axis_rows(tick, "stand-ramp" if stand_seconds else "ramp",
+                                  ramp_goal, ramped, bus, motor_ids))
             progress = min(int(tick - ramp_start), int(ramp_seconds))
             if progress != last_ramp_progress:
                 print(
@@ -1161,13 +1177,37 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             ramp_next += PERIOD
 
         last = initial_out.action_raw
-        print(f"RAMP complete: CAN tx={bus.tx_count}; entering policy hold.")
+        print(f"RAMP complete: CAN tx={bus.tx_count}; entering "
+              f"{'stand hold' if stand_seconds else 'policy hold'}.")
+        if stand_seconds:
+            print(f"STAND HOLD: holding the sim default pose for {stand_seconds:g}s. "
+                  "Hands off the legs now.")
+            stand_end = time.monotonic() + stand_seconds
+            stand_next = time.monotonic()
+            while time.monotonic() < stand_end:
+                time.sleep(max(0, stand_next - time.monotonic()))
+                tick = time.monotonic()
+                bus.feedback()
+                for fr in frames(STAND_TARGET, motor_ids):
+                    bus.send(fr)
+                rows.extend(axis_rows(tick, "stand-hold", STAND_TARGET, STAND_TARGET,
+                                      bus, motor_ids))
+                stand_next += PERIOD
+            print(f"STAND HOLD complete: CAN tx={bus.tx_count}.")
+            report_hold_pose([row for row in rows if row[1] == "stand-hold"],
+                             STAND_TARGET, motor_ids, current_limits)
+            if stand_only:
+                print("STAND ONLY: no policy stage. Sending zero MIT cleanup.")
+                return
+            # The sim starts every episode with a zero previous action; the
+            # action computed at the closed-leg start pose is stale by now.
+            last = np.zeros(ACTION_SIZE, np.float32)
         end=time.monotonic()+duration; nxt=time.monotonic()
         commanded_target = initial_targets[selected_index]
-        commanded_all = tuple(initial_targets)
+        commanded_all = tuple(ramp_goal)
         if policy_slew_rad_s is not None:
             print(f"POLICY SLEW: every axis limited to {np.rad2deg(policy_slew_rad_s):.1f}deg/s "
-                  "from the frozen ramp target toward the live policy output.")
+                  f"from the {'stand pose' if stand_seconds else 'frozen ramp target'} toward the live policy output.")
         previous_policy_tick = time.monotonic()
         last_policy_progress = -1
         while time.monotonic()<end:
@@ -1213,7 +1253,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             # A whole-body run is not pass/fail on one axis.  Report all ten
             # and let the judging table read the table, not a single verdict
             # keyed to the axis with the largest measured deadband.
-            report_all_axes(rows, initial_positions, initial_targets, motor_ids)
+            report_all_axes(rows, initial_positions, ramp_goal, motor_ids)
         elif max_tracking_rad < required_tracking_rad:
             report_deadband(selected_id, wire_kp, sustained_current_a(selected_rows), None)
             tracking_verdict = f"{tracking_verdict}; {torque_verdict}"
@@ -1295,7 +1335,7 @@ def analyze_csv(csv_path):
     if ticks:
         print(f"SPAN: {ticks[-1] - ticks[0]:.2f}s of wall time over "
               f"{len(ticks)} ticks. Stages present: {stages}.")
-        if not any(row[1] in ("policy", "probe-hold", "hold-pose") for row in rows):
+        if not any(row[1] in ("policy", "probe-hold", "hold-pose", "stand-hold") for row in rows):
             print(
                 "INCOMPLETE: this CSV holds ramp samples only. The run did not "
                 "reach its hold/policy stage, so it stopped early -- the CSV is "
@@ -1312,13 +1352,17 @@ def analyze_csv(csv_path):
             # The frozen ramp target, not the last live policy output: after
             # the handover `desired` is whatever the policy said on the tick
             # the run stopped, which is not what the ramp asked for.
-            ramp = [row for row in axis if row[1] == "ramp"]
+            ramp = [row for row in axis if row[1] in ("ramp", "stand-ramp")]
             target[mid] = ramp[0][3] if ramp else axis[-1][3]
         positions = tuple(start.get(mid, 0.0) for mid in H_CAN_IDS)
         targets = tuple(target.get(mid, start.get(mid, 0.0)) for mid in H_CAN_IDS)
         if rows[0][1] == "hold-pose":
             report_hold_pose(rows, positions, logged_ids, default_current_limits())
         else:
+            stand = [row for row in rows if row[1] == "stand-hold"]
+            if stand:
+                print("STAND HOLD (sim default pose):")
+                report_hold_pose(stand, STAND_TARGET, logged_ids, default_current_limits())
             report_all_axes(rows, positions, targets, logged_ids)
             report_slew_gap(rows, logged_ids)
         return 0
@@ -1365,6 +1409,8 @@ def main():
     p.add_argument('--hold-pose', action='store_true', help='with --arm --all-axes: freeze every target at the position that axis is already in and measure the current it needs to hold itself. No policy, no T265, no --package')
     p.add_argument('--gravity-limits', action='store_true', help=f'per-axis current abort sized to this robot static gravity load instead of the flat {CURRENT_ABORT_A:.1f}A one-axis limit. Requires --all-axes. Needs explicit user approval: it RAISES the abort on load-bearing axes')
     p.add_argument('--policy-slew-dps', type=float, help=f'with --arm --all-axes (required there): rate-limit EVERY axis target in the policy stage to this many deg/s, 0 < value <= {POLICY_SLEW_MAX_DPS:g}. Removes the ramp->policy step that tripped D10-3 R3/R4')
+    p.add_argument('--stand-seconds', type=float, help=f'with --arm --all-axes: ramp to the sim default pose (HAA 0, HFE -10, KFE +20, FFE -10 deg) over --ramp-seconds, hold it this long (0 < value <= {STAND_MAX_SECONDS:g}), then start the slew-limited policy from there')
+    p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
     current_mode = 'hold-pose' if a.hold_pose else 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
@@ -1396,6 +1442,16 @@ def main():
                     'without --hold-pose or --static-probe')
         if not 0 < a.policy_slew_dps <= POLICY_SLEW_MAX_DPS:
             p.error(f'--policy-slew-dps must satisfy 0 < value <= {POLICY_SLEW_MAX_DPS:g}')
+    if a.stand_seconds is not None or a.stand_only:
+        if not a.all_axes or a.hold_pose or a.static_probe:
+            p.error('--stand-seconds/--stand-only are for a whole-body run: --all-axes, '
+                    'without --hold-pose or --static-probe')
+        if a.stand_seconds is None or not 0 < a.stand_seconds <= STAND_MAX_SECONDS:
+            p.error(f'--stand-seconds must satisfy 0 < value <= {STAND_MAX_SECONDS:g}')
+        if a.stand_only and (a.duration or a.policy_slew_dps is not None
+                             or a.vx or a.vy or a.wz):
+            p.error('--stand-only runs no policy: leave --duration, --policy-slew-dps '
+                    'and --vx/--vy/--wz unset')
     if a.hold_pose:
         if not a.arm or a.preflight:
             p.error('--hold-pose requires --arm and cannot be combined with --preflight')
@@ -1449,9 +1505,12 @@ def main():
     if a.preflight:
         # A path is still supplied so evidence is written consistently, but
         # no policy frame or cleanup frame is put on CAN.
-        run(a.package, 0., a.csv or Path('logs/d9_preflight.csv'), a.vx, a.vy, a.wz, transmit=False)
+        run(a.package, 0., a.csv or Path('logs/d9_preflight.csv'), a.vx, a.vy, a.wz, transmit=False,
+            stand_seconds=a.stand_seconds)
         return 0
-    if not a.csv or not 0<a.duration<=5: p.error('--csv and 0<--duration<=5 are required with --arm')
+    if a.stand_only:
+        if not a.csv: p.error('--csv is required with --arm')
+    elif not a.csv or not 0<a.duration<=5: p.error('--csv and 0<--duration<=5 are required with --arm')
     if a.ramp_seconds is None or a.ramp_seconds <= 0: p.error('--arm requires a positive --ramp-seconds value')
     if a.all_axes:
         # Every axis at once is the whole-body step.  It is deliberate and
@@ -1461,7 +1520,7 @@ def main():
         # still watch every axis, not just the logged one.
         if a.motor_id:
             p.error('--all-axes drives every registered axis; do not also pass --motor-id')
-        if a.policy_slew_dps is None:
+        if a.policy_slew_dps is None and not a.stand_only:
             p.error('--all-axes with a policy requires --policy-slew-dps (D10-3: without it '
                     'nine axes step to the live policy output in one tick)')
         motor_ids = H_CAN_IDS
@@ -1476,5 +1535,6 @@ def main():
     run(a.package, a.duration, a.csv, a.vx, a.vy, a.wz,
         transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids,
         current_limits=limits,
-        policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)))
+        policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)),
+        stand_seconds=a.stand_seconds, stand_only=a.stand_only)
 if __name__=='__main__': sys.exit(main() or 0)

@@ -1120,3 +1120,102 @@ class AllAxesSlewTests(unittest.TestCase):
         text = buffer.getvalue()
         self.assertIn("asked= -11.46deg", text)
         self.assertIn("POLICY STAGE: 1 tick(s)", text)
+
+
+class StandPoseTests(unittest.TestCase):
+    """D10-5: ramp to the sim default pose, hold it, then hand over to the
+    slew-limited policy from there (not from the policy's first output)."""
+
+    _fake_bus = AllAxesSlewTests._fake_bus
+    _FakeT265 = AllAxesSlewTests._FakeT265
+
+    _STAND = [
+        "ver9_d8_sender.py", "--arm", "--all-axes", "--package", "pkg",
+        "--ramp-seconds", "10", "--csv", "s.csv", "--stand-seconds", "2",
+    ]
+
+    def test_stand_target_is_the_sim_default_pose(self):
+        deg = [round(float(np.rad2deg(v)), 1) for v in sender.STAND_TARGET]
+        self.assertEqual(deg, [0.0, 0.0, 0.0, 0.0, -10.0, -10.0, 20.0, 20.0, -10.0, -10.0])
+
+    def test_stand_only_needs_no_slew_or_duration(self):
+        with patch.object(sys, "argv", self._STAND + ["--stand-only"]), \
+                patch.object(sender, "run") as run:
+            sender.main()
+        self.assertTrue(run.call_args.kwargs["stand_only"])
+        self.assertEqual(run.call_args.kwargs["stand_seconds"], 2.0)
+
+    def test_stand_only_refuses_policy_arguments(self):
+        for extra in (["--duration", "3"], ["--policy-slew-dps", "20"], ["--vx", "0.2"]):
+            with patch.object(sys, "argv", self._STAND + ["--stand-only"] + extra), \
+                    patch.object(sender, "run") as run:
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_stand_seconds_range_and_scope(self):
+        bad = [
+            ["ver9_d8_sender.py", "--arm", "--all-axes", "--package", "pkg", "--ramp-seconds", "10",
+             "--csv", "s.csv", "--stand-seconds", "6", "--stand-only"],
+            ["ver9_d8_sender.py", "--arm", "--all-axes", "--hold-pose", "--duration", "2",
+             "--csv", "s.csv", "--stand-seconds", "2"],
+            ["ver9_d8_sender.py", "--arm", "--package", "pkg", "--motor-id", "0x1C", "--ramp-seconds",
+             "10", "--duration", "2", "--csv", "s.csv", "--stand-seconds", "2"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch.object(sender, "run_hold_pose") as hold:
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+            hold.assert_not_called()
+
+    def _run_stand(self, stand_only):
+        import contextlib
+        import csv as _csv
+        sent = []
+        first = SimpleNamespace(joint_target_h_order=(0.3,) * 10, action_raw=np.ones(10))
+        step = SimpleNamespace(joint_target_h_order=(1.2,) * 10, action_raw=np.zeros(10))
+        outputs = iter([first] + [step] * 1000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stand.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", self._fake_bus(sent)), \
+                    patch.object(sender, "RealT265", self._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 side_effect=lambda *a, **k: (None, None, next(outputs), None)), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.0 if stand_only else 0.2, path, 0.0, 0.0, 0.0,
+                           transmit=True, ramp_seconds=0.1, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.gravity_current_limits(),
+                           policy_slew_rad_s=None if stand_only else np.deg2rad(20.0),
+                           stand_seconds=0.1, stand_only=stand_only)
+            rows = list(_csv.DictReader(path.open(encoding="utf-8")))
+        return rows, buffer.getvalue()
+
+    def test_stand_only_ramps_to_default_and_runs_no_policy(self):
+        rows, text = self._run_stand(True)
+        stages = {r["stage"] for r in rows}
+        self.assertEqual(stages, {"stand-ramp", "stand-hold"})
+        for r in rows:
+            index = [f"0x{m:02X}" for m in sender.H_CAN_IDS].index(r["sent_motor_id"])
+            self.assertAlmostEqual(float(r["desired_target_rad"]), sender.STAND_TARGET[index])
+        self.assertIn("HOLD POSE RESULT", text)
+        self.assertIn("STAND ONLY", text)
+
+    def test_policy_starts_from_the_stand_pose_not_its_first_output(self):
+        rows, text = self._run_stand(False)
+        self.assertIn("stand-hold", {r["stage"] for r in rows})
+        policy = [r for r in rows if r["stage"] == "policy"]
+        self.assertTrue(policy)
+        ids = [f"0x{m:02X}" for m in sender.H_CAN_IDS]
+        first_tick = min(float(r["tick"]) for r in policy)
+        for r in policy:
+            if float(r["tick"]) != first_tick:
+                continue
+            index = ids.index(r["sent_motor_id"])
+            # One slew step (20 deg/s over at most ~one stand period) from the stand pose.
+            self.assertLess(abs(float(r["requested_target_rad"]) - sender.STAND_TARGET[index]),
+                            np.deg2rad(20.0) * 0.2)
+        self.assertIn("SLEW GAP", text)
