@@ -1622,3 +1622,118 @@ class LeanSweepTests(unittest.TestCase):
         self.assertIn("LEAN SWEEP (D10-11)", buffer.getvalue())
         self.assertIn("BALANCE LEAN", analyzed.getvalue())
         self.assertIn("custom stand pose", analyzed.getvalue())
+
+
+class AutoLeanWalkTests(unittest.TestCase):
+    """D10-12 (2026-09-23): auto lean inside the stand hold, and the walk limits."""
+
+    _POLICY = ["ver9_d8_sender.py", "--arm", "--all-axes", "--stand-seconds", "20",
+               "--package", "x", "--ramp-seconds", "10", "--duration", "5",
+               "--csv", "x.csv"]
+
+    def test_auto_lean_step_follows_heels_and_is_bounded(self):
+        dt = 0.02
+        heels = [np.deg2rad(6.0), np.deg2rad(6.0)]
+        toes = [np.deg2rad(-6.0), np.deg2rad(-6.0)]
+        up = sender.auto_lean_step(0.0, heels, dt, np.deg2rad(8))
+        self.assertAlmostEqual(np.rad2deg(up), sender.AUTO_LEAN_MAX_DPS * dt)  # rate-limited
+        self.assertEqual(sender.auto_lean_step(0.0, toes, dt, np.deg2rad(8)), 0.0)  # never below 0
+        self.assertAlmostEqual(sender.auto_lean_step(np.deg2rad(8), heels, dt, np.deg2rad(8)),
+                               np.deg2rad(8))  # never above max
+        small = sender.auto_lean_step(0.0, [np.deg2rad(1.0)] * 2, dt, np.deg2rad(8))
+        self.assertAlmostEqual(np.rad2deg(small), sender.AUTO_LEAN_GAIN * 1.0 * dt)
+
+    def test_walk_limits_table_and_flags(self):
+        walk = sender.walk_current_limits()
+        floor = sender.floor_current_limits()
+        for mid in sender.H_CAN_IDS:
+            if sender.joint_suffix(mid) in ("KFE", "FFE"):
+                self.assertEqual(walk[mid], 10.0)
+            else:
+                self.assertEqual(walk[mid], floor[mid])
+        argv = self._POLICY + ["--walk-limits", "--auto-lean-deg", "8",
+                               "--policy-slew-dps", "150", "--vx", "0.2"]
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", out):
+            sender.main()
+        kw = run.call_args.kwargs
+        self.assertEqual(kw["current_limits"], walk)
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(200.0))
+        self.assertAlmostEqual(kw["auto_lean_rad"], np.deg2rad(8))
+        self.assertAlmostEqual(kw["policy_slew_rad_s"], np.deg2rad(150.0))
+        self.assertIn("WALK LIMITS", out.getvalue())
+
+    def test_floor_policy_keeps_the_old_speed_and_slew(self):
+        argv = self._POLICY + ["--floor-limits", "--auto-lean-deg", "8", "--policy-slew-dps", "60"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", io.StringIO()):
+            sender.main()
+        self.assertIsNone(run.call_args.kwargs["speed_abort_rad_s"])
+        self.assertEqual(run.call_args.kwargs["current_limits"], sender.floor_current_limits())
+
+    def test_refusals(self):
+        bad = [
+            self._POLICY + ["--floor-limits", "--policy-slew-dps", "100"],        # >60 without walk
+            self._POLICY + ["--walk-limits", "--floor-limits", "--policy-slew-dps", "60"],
+            self._POLICY + ["--walk-limits"],                                      # no slew
+            self._POLICY + ["--walk-limits", "--policy-slew-dps", "201"],
+            self._POLICY + ["--gravity-limits", "--auto-lean-deg", "8", "--policy-slew-dps", "30"],
+            self._POLICY[:4] + ["10"] + self._POLICY[5:] + ["--floor-limits", "--auto-lean-deg", "8",
+                                                            "--policy-slew-dps", "30"],
+            self._POLICY + ["--floor-limits", "--auto-lean-deg", "9", "--policy-slew-dps", "30"],
+            self._POLICY + ["--floor-limits", "--auto-lean-deg", "8", "--stand-lean-deg", "3",
+                            "--policy-slew-dps", "30"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_run_leans_from_the_heels_and_policy_starts_from_the_leaned_pose(self):
+        import contextlib
+        import csv as _csv
+        sent = []
+        base_bus = AllAxesSlewTests._fake_bus(None, sent)
+        ffe_ids = {sender.H_CAN_IDS[i] for i in sender.ffe_indices()}
+
+        class HeelBus(base_bus):
+            def feedback(self):
+                # FFE sits 20 deg toe-up: the robot is on its heels, so the lean should grow.
+                return {mid: sender.MotorFeedback(mid, 0.0, -0.35 if mid in ffe_ids else 0.0, 0.0)
+                        for mid in sender.H_CAN_IDS}
+
+        first = SimpleNamespace(joint_target_h_order=sender.STAND_TARGET, action_raw=np.zeros(10))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "auto.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), patch.object(sender, "DualBus", HeelBus), \
+                    patch.object(sender, "RealT265", AllAxesSlewTests._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 side_effect=lambda *a, **k: (None, None, first, None)), \
+                    patch.object(sender, "AUTO_LEAN_START_S", 0.0), \
+                    patch.object(sender, "AUTO_LEAN_MAX_DPS", 100.0), \
+                    patch.object(sender, "AUTO_LEAN_GAIN", 50.0), \
+                    patch.object(sender, "STAND_MAX_SECONDS", 0.05), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.1, path, 0.0, 0.0, 0.0, transmit=True,
+                           ramp_seconds=0.05, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.walk_current_limits(),
+                           policy_slew_rad_s=np.deg2rad(150.0), stand_seconds=0.4,
+                           auto_lean_rad=np.deg2rad(8.0),
+                           speed_abort_rad_s=np.deg2rad(200.0))
+            with path.open(encoding="utf-8") as handle:
+                rows = list(_csv.DictReader(handle))
+        text = buffer.getvalue()
+        self.assertIn("AUTO LEAN RESULT: final lean +8.0deg", text)
+        ffe_labels = {f"0x{m:02X}" for m in ffe_ids}
+        hold = [r for r in rows if r["stage"] == "stand-hold" and r["sent_motor_id"] in ffe_labels]
+        self.assertAlmostEqual(np.rad2deg(float(hold[-1]["requested_target_rad"])),
+                               np.rad2deg(sender.STAND_TARGET[sender.ffe_indices()[0]]) + 8.0, places=3)
+        policy = [r for r in rows if r["stage"] == "policy" and r["sent_motor_id"] in ffe_labels]
+        first_policy = policy[0]
+        # The first policy tick slews from the LEANED pose toward the policy target (the sim default).
+        self.assertGreater(np.rad2deg(float(first_policy["requested_target_rad"])),
+                           np.rad2deg(sender.STAND_TARGET[sender.ffe_indices()[0]]) + 8.0 - 3.1)

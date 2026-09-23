@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_11_LEANSWEEP_20260923_1700"
+BUILD_ID = "D10_12_AUTOLEAN_WALK_20260923_1730"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -120,6 +120,32 @@ STAND_LEAN_MAX_DEG = 8.0
 LEAN_SWEEP_DPS = 0.5
 LEAN_SWEEP_MAX_DEG = 10.0
 LEAN_SWEEP_HOLD_S = 3.0
+# D10-12 (2026-09-23): no time to run D10-11 first.  --auto-lean-deg finds
+# the balance lean inside the stand hold of the SAME run that then starts the
+# policy: from AUTO_LEAN_START_S into the hold (the hoist is lowered before
+# that), the lean on both FFE follows the mean FFE error (target - feedback,
+# + = on the heels) at AUTO_LEAN_GAIN deg/s per deg of error, rate-limited
+# to AUTO_LEAN_MAX_DPS and clamped to [0, M].  The policy then starts from the
+# leaned pose.  Same sign convention and error signal as --lean-sweep-deg.
+AUTO_LEAN_START_S = 12.0
+AUTO_LEAN_GAIN = 0.2
+AUTO_LEAN_MAX_DPS = 0.5
+# D10-12: walking needs more than the hanging guards allow.  The sim policy
+# moves KFE at ~250 deg/s (golden, std), the D10-10 policy stage died on FFE
+# ~6 A while catching a backward fall, and a 60 deg/s slew held KFE up to
+# 209 deg behind the policy.  --walk-limits (explicit approval, hoist rope
+# attached) is --floor-limits with KFE/FFE 10 A, speed abort 200 deg/s and a
+# slew allowed up to 200 deg/s.  Still under the policy's own effort
+# (AK10-9 42.1 A, AK80-9 25.8 A).  Nothing else changes.
+WALK_CURRENT_ABORT_A_BY_JOINT = {
+    "HR":   3.0,
+    "HAA":  6.0,
+    "HFE": 11.0,
+    "KFE": 10.0,
+    "FFE": 10.0,
+}
+WALK_SPEED_ABORT_RAD_S = float(np.deg2rad(200.0))
+WALK_POLICY_SLEW_MAX_DPS = 200.0
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -510,6 +536,20 @@ def run_lean_sweep(bus, rows, stand_target, max_rad, motor_ids):
             break
         nxt += PERIOD
     return report_lean_sweep(rows)
+
+
+def walk_current_limits():
+    """D10-12: --floor-limits with KFE/FFE at 10 A for a policy run on the floor."""
+    return {mid: WALK_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)] for mid in H_CAN_IDS}
+
+
+def auto_lean_step(lean_rad, ffe_errors_rad, dt_s, max_rad):
+    """One update of the auto lean: follow the mean FFE error, rate-limited, clamped to [0, max]."""
+    rate = float(np.deg2rad(AUTO_LEAN_MAX_DPS))
+    mean_err_deg = float(np.rad2deg(np.mean(ffe_errors_rad)))
+    step_rad = float(np.deg2rad(AUTO_LEAN_GAIN * mean_err_deg)) * dt_s
+    step_rad = max(-rate * dt_s, min(rate * dt_s, step_rad))
+    return max(0.0, min(abs(max_rad), lean_rad + step_rad))
 
 
 def floor_current_limits():
@@ -1102,11 +1142,12 @@ class DualBus:
             if abs(p) > ORIGIN_ABORT_RAD:
                 raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg; D7 o 0 is required")
             limit = self.current_limit_a.get(mid, CURRENT_ABORT_A)
-            if abs(s.cur)>limit or abs(v)>SPEED_ABORT_RAD_S:
+            speed_limit = getattr(self, "speed_abort_rad_s", SPEED_ABORT_RAD_S)
+            if abs(s.cur)>limit or abs(v)>speed_limit:
                 raise RuntimeError(
                     f"motion/current abort 0x{mid:02X} ch={channel}: "
                     f"cur={s.cur:+.2f}A (limit ±{limit:.2f}A), "
-                    f"speed={np.rad2deg(v):+.1f}deg/s (limit ±{np.rad2deg(SPEED_ABORT_RAD_S):.1f}deg/s), "
+                    f"speed={np.rad2deg(v):+.1f}deg/s (limit ±{np.rad2deg(speed_limit):.1f}deg/s), "
                     f"pos={np.rad2deg(p):+.1f}deg"
                 )
             out[mid]=MotorFeedback(mid,now,p,v)
@@ -1475,9 +1516,12 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None):
     current_limits = dict(current_limits or default_current_limits())
-    policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
+    policy=HPolicy(package); bus=DualBus(current_limits)
+    if speed_abort_rad_s is not None:
+        bus.speed_abort_rad_s = speed_abort_rad_s
+    t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
     # D10-8: every policy evaluation's full 42-dim observation and raw action,
     # so what the policy SAW can be judged from the saved log.
@@ -1619,22 +1663,45 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             stand_next = stand_start
             window = []
             next_progress = stand_start + STAND_PROGRESS_S
+            hold_target = tuple(stand_target)
+            lean = 0.0
+            ffe = ffe_indices()
+            if auto_lean_rad:
+                print(f"AUTO LEAN: from {AUTO_LEAN_START_S:g}s into the hold, both FFE lean toe-down "
+                      f"to balance (0..{np.rad2deg(abs(auto_lean_rad)):.1f}deg). Lower the hoist before that.")
             while time.monotonic() < stand_end:
                 time.sleep(max(0, stand_next - time.monotonic()))
                 tick = time.monotonic()
-                bus.feedback()
-                for fr in frames(stand_target, motor_ids):
+                feedback = bus.feedback()
+                if auto_lean_rad and tick - stand_start >= AUTO_LEAN_START_S:
+                    errors = [hold_target[i] - feedback[H_CAN_IDS[i]].position for i in ffe]
+                    lean = auto_lean_step(lean, errors, PERIOD, auto_lean_rad)
+                    shifted = list(stand_target)
+                    for i in ffe:
+                        shifted[i] = stand_target[i] + lean
+                    hold_target = tuple(shifted)
+                for fr in frames(hold_target, motor_ids):
                     bus.send(fr)
-                new_rows = axis_rows(tick, "stand-hold", stand_target, stand_target,
+                new_rows = axis_rows(tick, "stand-hold", hold_target, hold_target,
                                      bus, motor_ids)
                 rows.extend(new_rows)
                 if stand_seconds > STAND_MAX_SECONDS:
                     window.extend(new_rows)
                     if tick >= next_progress:
-                        print(stand_progress_line(tick - stand_start, stand_seconds, window))
+                        line = stand_progress_line(tick - stand_start, stand_seconds, window)
+                        if auto_lean_rad:
+                            line += (f"; lean=+{np.rad2deg(lean):.1f}deg FFE err "
+                                     + "/".join(f"{np.rad2deg(hold_target[i] - feedback[H_CAN_IDS[i]].position):+.1f}"
+                                                for i in ffe))
+                        print(line)
                         window = []
                         next_progress += STAND_PROGRESS_S
                 stand_next += PERIOD
+            if auto_lean_rad:
+                print(f"AUTO LEAN RESULT: final lean +{np.rad2deg(lean):.1f}deg "
+                      f"(limit {np.rad2deg(abs(auto_lean_rad)):.1f}); the policy starts from this pose."
+                      + (" LIMIT REACHED: still on the heels." if lean >= abs(auto_lean_rad) - 1e-6 else ""))
+            stand_target = hold_target
             print(f"STAND HOLD complete: CAN tx={bus.tx_count}.")
             print_look_check(stand_target)
             report_hold_pose([row for row in rows if row[1] == "stand-hold"],
@@ -1651,7 +1718,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             last = np.zeros(ACTION_SIZE, np.float32)
         end=time.monotonic()+duration; nxt=time.monotonic()
         commanded_target = initial_targets[selected_index]
-        commanded_all = tuple(ramp_goal)
+        commanded_all = tuple(stand_target) if stand_seconds else tuple(ramp_goal)
         if policy_slew_rad_s is not None:
             print(f"POLICY SLEW: every axis limited to {np.rad2deg(policy_slew_rad_s):.1f}deg/s "
                   f"from the {'stand pose' if stand_seconds else 'frozen ramp target'} toward the live policy output.")
@@ -1969,6 +2036,8 @@ def main():
     p.add_argument('--stand-knee-deg', type=float, help=f'D10-11: stand pose HFE=-K/2, KFE=+K, FFE=-K/2 (sole parallel to the body) instead of the sim default (K=20); 0 <= K <= {STAND_KNEE_MAX_DEG:g}')
     p.add_argument('--stand-lean-deg', type=float, help=f'D10-11: add this many deg to both FFE stand targets (+ = toe down = robot leans FORWARD once the sole is flat on the floor); {STAND_LEAN_MIN_DEG:g} <= L <= {STAND_LEAN_MAX_DEG:g}')
     p.add_argument('--lean-sweep-deg', type=float, help=f'D10-11, with --floor-limits --stand-only: after the stand hold, add toe-down lean to both FFE at {LEAN_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {LEAN_SWEEP_MAX_DEG:g}) and log where the robot balances over its ankles')
+    p.add_argument('--auto-lean-deg', type=float, help=f'D10-12, with --floor-limits or --walk-limits and --stand-seconds >= {AUTO_LEAN_START_S + 4:g}: from {AUTO_LEAN_START_S:g}s into the stand hold, lean both FFE toe-down until the ankles stop being pushed toe-up (0 < max <= {STAND_LEAN_MAX_DEG:g} deg); the policy starts from the leaned pose')
+    p.add_argument('--walk-limits', action='store_true', help=f'D10-12, policy on the floor with the hoist rope attached: --floor-limits with KFE/FFE {WALK_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} A, speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} deg/s, --policy-slew-dps allowed up to {WALK_POLICY_SLEW_MAX_DPS:g}. Needs explicit user approval')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -1984,6 +2053,13 @@ def main():
     if a.gravity_limits and a.static_probe:
         p.error('--gravity-limits must not be combined with --static-probe; a one-axis '
                 'probe carries no load and its limit is not the thing under test')
+    if a.walk_limits:
+        if a.gravity_limits or a.floor_limits:
+            p.error('--walk-limits already contains the floor table; do not also pass --floor-limits/--gravity-limits')
+        if not a.all_axes or a.stand_seconds is None or a.stand_only or a.policy_slew_dps is None:
+            p.error('--walk-limits is for a policy run on the floor: --all-axes, --stand-seconds, '
+                    '--policy-slew-dps, no --stand-only')
+        a.floor_limits = True
     if a.floor_limits:
         if a.gravity_limits:
             p.error('--floor-limits already contains the --gravity-limits table; pass one of them')
@@ -1992,9 +2068,15 @@ def main():
                     '--stand-seconds, without --hold-pose or --static-probe')
         if a.haa_close_deg is not None or a.sign_pose:
             p.error('--floor-limits is not for the hanging checks (--haa-close-deg, --sign-pose)')
-    limits = (floor_current_limits() if a.floor_limits
+    limits = (walk_current_limits() if a.walk_limits
+              else floor_current_limits() if a.floor_limits
               else gravity_current_limits() if a.gravity_limits else default_current_limits())
-    if a.floor_limits:
+    if a.walk_limits:
+        print("WALK LIMITS: per-axis current abort " + ", ".join(
+            f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS)
+            + f"; speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}deg/s; slew allowed up to "
+            f"{WALK_POLICY_SLEW_MAX_DPS:g}deg/s. Keep the hoist rope attached.")
+    elif a.floor_limits:
         print("FLOOR LIMITS: per-axis current abort " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS))
         print(f"FLOOR LIMITS: --gravity-limits with KFE/FFE raised for a loaded stand "
@@ -2012,12 +2094,14 @@ def main():
               "values are still far under the trained policy's own effort limit "
               "(AK10-9 42.1A, AK80-9 25.8A). Speed abort, stale feedback, motor "
               "error and origin aborts are unchanged.")
+    slew_max = WALK_POLICY_SLEW_MAX_DPS if a.walk_limits else POLICY_SLEW_MAX_DPS
     if a.policy_slew_dps is not None:
         if not a.arm or not a.all_axes or a.hold_pose or a.static_probe:
             p.error('--policy-slew-dps is only for a whole-body policy run: --arm --all-axes, '
                     'without --hold-pose or --static-probe')
-        if not 0 < a.policy_slew_dps <= POLICY_SLEW_MAX_DPS:
-            p.error(f'--policy-slew-dps must satisfy 0 < value <= {POLICY_SLEW_MAX_DPS:g}')
+        if not 0 < a.policy_slew_dps <= slew_max:
+            p.error(f'--policy-slew-dps must satisfy 0 < value <= {slew_max:g}'
+                    + ('' if a.walk_limits else f' ({WALK_POLICY_SLEW_MAX_DPS:g} only with --walk-limits)'))
     if a.stand_seconds is not None or a.stand_only:
         if not a.all_axes or a.hold_pose or a.static_probe:
             p.error('--stand-seconds/--stand-only are for a whole-body run: --all-axes, '
@@ -2044,6 +2128,18 @@ def main():
               f"({a.haa_close_deg / HAA_SWEEP_DPS:.1f}s), stop and freeze at the first block.")
     haa_close_rad = None if a.haa_close_deg is None else float(np.deg2rad(a.haa_close_deg))
     stand_target = SIGN_POSE_TARGET if a.sign_pose else STAND_TARGET
+    auto_lean_rad = None
+    if a.auto_lean_deg is not None:
+        if not a.floor_limits or a.stand_seconds is None or a.stand_seconds < AUTO_LEAN_START_S + 4:
+            p.error(f'--auto-lean-deg needs --floor-limits or --walk-limits and '
+                    f'--stand-seconds >= {AUTO_LEAN_START_S + 4:g}')
+        if a.lean_sweep_deg is not None or a.stand_lean_deg is not None:
+            p.error('--auto-lean-deg replaces --lean-sweep-deg/--stand-lean-deg; pass one')
+        if not 0 < a.auto_lean_deg <= STAND_LEAN_MAX_DEG:
+            p.error(f'--auto-lean-deg must satisfy 0 < value <= {STAND_LEAN_MAX_DEG:g}')
+        auto_lean_rad = float(np.deg2rad(a.auto_lean_deg))
+        print(f"AUTO LEAN planned: up to +{a.auto_lean_deg:g}deg on both FFE from "
+              f"{AUTO_LEAN_START_S:g}s into the {a.stand_seconds:g}s stand hold.")
     lean_sweep_rad = None
     if a.stand_knee_deg is not None or a.stand_lean_deg is not None or a.lean_sweep_deg is not None:
         if a.stand_seconds is None or a.sign_pose or a.haa_close_deg is not None:
@@ -2156,5 +2252,7 @@ def main():
         current_limits=limits,
         policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)),
         stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target,
-        haa_close_rad=haa_close_rad, lean_sweep_rad=lean_sweep_rad)
+        haa_close_rad=haa_close_rad, lean_sweep_rad=lean_sweep_rad,
+        auto_lean_rad=auto_lean_rad,
+        speed_abort_rad_s=WALK_SPEED_ABORT_RAD_S if a.walk_limits else None)
 if __name__=='__main__': sys.exit(main() or 0)
