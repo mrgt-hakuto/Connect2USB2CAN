@@ -2097,3 +2097,117 @@ class ZeroOffsetTests(unittest.TestCase):
         start[sender.H_CAN_IDS.index(0x1A)] = target[sender.H_CAN_IDS.index(0x1A)] - np.deg2rad(40)
         self.assertTrue(sender.all_axes_prearm_violations(target, start))
         self.assertFalse(sender.all_axes_prearm_violations(target, start, sender.STAND_RAMP_MAX_DELTA_DEG))
+
+
+class TiltGainOriginTests(unittest.TestCase):
+    """D10-13E (2026-09-23): origin abort from the stand pose, tilt abort, policy gain scale."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "10"]
+
+    def setUp(self):
+        self.addCleanup(sender.set_zero_offset, None)
+        self.addCleanup(sender.set_gain_scale, 1.0)
+
+    def _main(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", out):
+            sender.main()
+        return run.call_args.kwargs, out.getvalue()
+
+    def test_defaults_are_unchanged(self):
+        kw, text = self._main(self._WALK)
+        self.assertFalse(kw["origin_ref_stand"])
+        self.assertIsNone(kw["tilt_abort_rad"])
+        self.assertIsNone(kw["policy_gain_scale"])
+        self.assertNotIn("ORIGIN REF", text)
+        self.assertEqual(sender.GAIN_SCALE, 1.0)
+
+    def test_flags_reach_run(self):
+        kw, text = self._main(self._WALK + ["--origin-ref", "stand", "--tilt-abort-deg", "35",
+                                            "--policy-gain-scale", "0.7"])
+        self.assertTrue(kw["origin_ref_stand"])
+        self.assertAlmostEqual(kw["tilt_abort_rad"], np.deg2rad(35.0))
+        self.assertEqual(kw["policy_gain_scale"], 0.7)
+        self.assertIn("ORIGIN REF stand", text)
+        self.assertIn("TILT ABORT armed", text)
+        # Planning the scale must not change the gains before the policy stage.
+        self.assertEqual(sender.GAIN_SCALE, 1.0)
+
+    def test_refusals(self):
+        floor = [a if a != "--walk-limits" else "--floor-limits" for a in self._WALK]
+        floor[floor.index("200")] = "60"
+        bad = [
+            self._WALK + ["--origin-ref", "stand"],                       # no tilt abort
+            self._WALK + ["--tilt-abort-deg", "14"],
+            self._WALK + ["--tilt-abort-deg", "41"],
+            self._WALK + ["--policy-gain-scale", "1.1"],
+            self._WALK + ["--policy-gain-scale", "0.4"],
+            floor + ["--tilt-abort-deg", "30"],
+            floor + ["--policy-gain-scale", "0.7"],
+            floor + ["--origin-ref", "stand", "--tilt-abort-deg", "30"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_gain_scale_scales_kp_and_kd_and_never_raises(self):
+        base = sender.gains()
+        sender.set_gain_scale(0.7)
+        scaled = sender.gains()
+        for (kp, kd), (kp7, kd7) in zip(base, scaled):
+            self.assertAlmostEqual(kp7, 0.7 * kp)
+            self.assertAlmostEqual(kd7, 0.7 * kd)
+        with self.assertRaises(ValueError):
+            sender.set_gain_scale(1.2)
+        sender.set_gain_scale(None)
+        self.assertEqual(sender.gains(), base)
+
+    def test_origin_from_stand_pose(self):
+        sender.set_zero_offset("cad_fk")
+        # LL_KFE stand = 20 deg sim = 32.3 deg from D7.  D10-13D R3 died at LR_KFE +45.4 deg
+        # from D7 (= 18 deg past its stand); the LL analogue must pass now.
+        center = float(sender.STAND_TARGET[sender.H_CAN_IDS.index(0x1A)] - sender.ZERO_OFFSET_RAD[sender.H_CAN_IDS.index(0x1A)])
+        self.assertAlmostEqual(np.rad2deg(center), 32.3, delta=0.05)
+        self.assertIsNotNone(sender.origin_violation(0x1A, np.deg2rad(46.8)))           # old rule
+        self.assertIsNone(sender.origin_violation(0x1A, np.deg2rad(46.8), center))      # new rule
+        self.assertIsNotNone(sender.origin_violation(0x1A, np.deg2rad(78.0), center))   # 45.7 from stand
+        self.assertIsNotNone(sender.origin_violation(0x1A, np.deg2rad(-11.0), center))  # hyperextended
+        self.assertIsNone(sender.origin_violation(0x1A, np.deg2rad(-9.0), center))
+        # HFE: stand -12.9 deg from D7; the backstop is 75 deg from D7.
+        hfe_center = np.deg2rad(-12.9)
+        self.assertIsNone(sender.origin_violation(0x21, np.deg2rad(30.0), hfe_center))
+        self.assertIsNotNone(sender.origin_violation(0x21, np.deg2rad(33.0), hfe_center))
+
+    def test_feedback_uses_the_stand_centre(self):
+        import time as _time
+
+        def state_for(mid):
+            sign = 1.0 if sender.servo_feedback_to_h_units(1.0, 0.0, mid)[0] > 0 else -1.0
+            return SimpleNamespace(t=_time.time(), err=0, pos=46.8 * sign, spd=0.0, cur=0.0)
+
+        route_bus = type("Bus", (), {"state": lambda _self, mid: state_for(mid)})()
+        bus = sender.DualBus.__new__(sender.DualBus)
+        bus.bus_by_channel = {0: route_bus, 1: object()}
+        bus.route_by_motor_id = {mid: route_bus for mid in sender.H_CAN_IDS}
+        bus.current_limit_a = {mid: 99.0 for mid in sender.H_CAN_IDS}
+        # every axis at H +46.8 deg from D7: the old rule aborts ...
+        with self.assertRaisesRegex(RuntimeError, "origin/pre-arm pose abort .*from the D7 origin"):
+            bus.feedback()
+        # ... measured from a stand pose at H +30 deg it is 16.8 deg away and passes.
+        bus.origin_center_rad = {mid: float(np.deg2rad(30.0)) for mid in sender.H_CAN_IDS}
+        bus.feedback()
+
+    def test_tilt_abort_gets_a_soft_stop(self):
+        self.assertTrue(sender.is_soft_stop_abort(RuntimeError("tilt abort: pitch +36.0deg roll +1.0deg")))
+
+    def test_policy_start_line(self):
+        rows = [("0", "stand-gate", "", "", "", "", "", "", "-3.0", "0")]
+        for i, p in enumerate((-3, 0, 5, 10, 14, 12, 6, 2, 1, 1, 2, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)):
+            rows.append((str(1 + 0.02 * i), "policy", "", "", "", "", "", "", str(p), "0"))
+        line = sender.policy_start_line(rows)
+        self.assertIn("peak |pitch| in 0.5s +14.0deg at 0.08s", line)
+        self.assertIn("came back to +1.0deg", line)

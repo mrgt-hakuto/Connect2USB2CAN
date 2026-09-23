@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13D_ZEROOFFSET_20260923_2300"
+BUILD_ID = "D10_13E_TILTGAIN_20260923_2200"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -166,7 +166,7 @@ COMMAND_DELAY_MAX_S = 5.0
 #     zero MIT at once.  Without the flag nothing changes.
 WALK_SPEED_ABORT_MAX_DPS = 400.0
 SOFT_STOP_MAX_S = 5.0
-SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort")
+SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort", "tilt abort")
 # D10-13C (2026-09-23): the only long policy stage so far (7.4 s of stepping
 # in place, D10-13B 19:14) started with the body upright (pitch -1 deg).
 # Every run that started leaning back 14-26 deg ended within 0.7 s.  The sim
@@ -203,6 +203,29 @@ ZERO_OFFSET_RAD = np.zeros(10)   # H order; sim_angle = D7-origin angle + this
 # D10-13D: a whole-body run that ramps to the fixed stand pose over >= 10 s may
 # start up to this far from it (the policy-target gate stays at 30 deg).
 STAND_RAMP_MAX_DELTA_DEG = 45.0
+# D10-13E (2026-09-23): with --zero-offset cad_fk the stand pose itself sits
+# 27-32 deg (KFE) from the D7 origin, so the 45 deg origin abort left the knee
+# only 13-18 deg to bend.  D10-13D R3 (vx 0.2) was recovering (pitch +14 ->
+# +1 deg) and stepping when LR_KFE reached +45.4 deg from D7 = +18 deg past the
+# stand pose, and was stopped there.  The origin abort had become a joint range
+# limit around the wrong centre.
+#   --origin-ref stand (with --walk-limits): measure the 45 deg from the stand
+#     pose (sim default + offset) instead of the D7 origin.  Two backstops stay:
+#     |angle from D7| <= ORIGIN_BACKSTOP_DEG, and the knee may not go past
+#     straight by more than KFE_HYPEREXTEND_DEG.
+#   --tilt-abort-deg T (required with --origin-ref stand): in the policy stage,
+#     |pitch| or |roll| from the T265 above T ends the run (soft stop if armed).
+#     That is the fall the origin abort used to catch by accident.
+#   --policy-gain-scale S: Kp and Kd x S in the policy stage only (stand hold,
+#     gate and soft stop keep the full gains).  Tests the Kt hypothesis: if the
+#     real torque per commanded Kp is 1.0-1.6x the sim, S = 0.7 undoes most of it.
+ORIGIN_BACKSTOP_DEG = 75.0
+KFE_HYPEREXTEND_DEG = 10.0
+TILT_ABORT_MIN_DEG = 15.0
+TILT_ABORT_MAX_DEG = 40.0
+POLICY_GAIN_SCALE_MIN = 0.5
+POLICY_GAIN_SCALE_MAX = 1.0
+GAIN_SCALE = 1.0   # multiplies every Kp/Kd; only run() changes it, for the policy stage
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -434,7 +457,39 @@ CP = {"AK80-9": .523, "AK10-9": 1.258}
 CD = {"AK80-9": .523, "AK10-9": 1.216}
 
 def gains():
-    return tuple((float(STIFFNESS[i]/CP[m]), float(DAMPING[i]/CD[m])) for i,m in enumerate(H_MODELS))
+    return tuple((float(GAIN_SCALE*STIFFNESS[i]/CP[m]), float(GAIN_SCALE*DAMPING[i]/CD[m])) for i,m in enumerate(H_MODELS))
+
+
+def set_gain_scale(scale):
+    """D10-13E: Kp/Kd multiplier (1.0 = unchanged).  Never above 1."""
+    global GAIN_SCALE
+    scale = 1.0 if scale is None else float(scale)
+    if not POLICY_GAIN_SCALE_MIN <= scale <= POLICY_GAIN_SCALE_MAX:
+        raise ValueError(f"gain scale must satisfy {POLICY_GAIN_SCALE_MIN:g} <= value <= {POLICY_GAIN_SCALE_MAX:g}")
+    GAIN_SCALE = scale
+    return scale
+
+
+def origin_violation(mid, d7_rad, center_rad=None):
+    """None, or why this D7-frame H angle is outside the origin check (D10-13E).
+
+    center_rad None = the D7 origin, limit ORIGIN_ABORT_RAD (unchanged).
+    Otherwise the limit is measured from center_rad, plus the two backstops.
+    """
+    if center_rad is None:
+        if abs(d7_rad) > ORIGIN_ABORT_RAD:
+            return (f"{np.rad2deg(d7_rad):+.1f}deg from the D7 origin "
+                    f"(limit {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg)")
+        return None
+    if abs(d7_rad - center_rad) > ORIGIN_ABORT_RAD:
+        return (f"{np.rad2deg(d7_rad - center_rad):+.1f}deg from the stand pose "
+                f"(limit {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg; D7 angle {np.rad2deg(d7_rad):+.1f}deg)")
+    if abs(d7_rad) > np.deg2rad(ORIGIN_BACKSTOP_DEG):
+        return f"{np.rad2deg(d7_rad):+.1f}deg from the D7 origin (backstop {ORIGIN_BACKSTOP_DEG:g}deg)"
+    if joint_suffix(mid) == "KFE" and d7_rad < -np.deg2rad(KFE_HYPEREXTEND_DEG):
+        return (f"knee {np.rad2deg(d7_rad):+.1f}deg past straight "
+                f"(limit -{KFE_HYPEREXTEND_DEG:g}deg)")
+    return None
 
 
 def h_feedback(motor_id, state):
@@ -1214,9 +1269,10 @@ class DualBus:
                 raise RuntimeError(f"stale feedback 0x{mid:02X} ch={channel}")
             if s.err: raise RuntimeError(f"motor error 0x{mid:02X} ch={channel}: {s.err}")
             p,v=servo_feedback_to_h_units(s.pos,s.spd,mid)
-            if abs(p) > ORIGIN_ABORT_RAD:
-                raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg "
-                                   f"from the D7 origin (limit {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg). "
+            centers = getattr(self, "origin_center_rad", None)
+            why = origin_violation(mid, p, None if centers is None else centers[mid])
+            if why:
+                raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {why}. "
                                    "If the leg really is there, no new D7 is needed; if it is not, redo D7 o 0")
             p = p + zero_offset_rad(mid)
             limit = self.current_limit_a.get(mid, CURRENT_ABORT_A)
@@ -1594,13 +1650,17 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False,origin_ref_stand=False,tilt_abort_rad=None,policy_gain_scale=None):
     timer_state = enable_fine_timer() if fine_timer else None
     timing_rows = []
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits)
     if speed_abort_rad_s is not None:
         bus.speed_abort_rad_s = speed_abort_rad_s
+    if origin_ref_stand:
+        # D10-13E: the stand pose in the D7 frame (sim angle - offset).
+        bus.origin_center_rad = {mid: float(stand_target[i] - ZERO_OFFSET_RAD[i])
+                                 for i, mid in enumerate(H_CAN_IDS)}
     t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
     abort_message=None
@@ -1859,6 +1919,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         command_started = False
         if command_delay_s is not None:
             print(f"COMMAND DELAY: zero command for the first {command_delay_s:g}s of the policy stage.")
+        if policy_gain_scale is not None:
+            set_gain_scale(policy_gain_scale)
+            print(f"POLICY GAIN SCALE: Kp/Kd x{GAIN_SCALE:g} from now (policy stage only).")
         try:
             while time.monotonic()<end:
                 time.sleep(max(0,nxt-time.monotonic())); tick=time.monotonic()
@@ -1868,6 +1931,12 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                           f"({tick - policy_start:.2f}s into the policy stage).")
                     command_started = True
                 t265_sample = t265.latest()
+                if tilt_abort_rad:
+                    pitch_now, roll_now = tilt_deg(t265_sample)
+                    if pitch_now is not None and max(abs(pitch_now), abs(roll_now)) > np.rad2deg(tilt_abort_rad):
+                        raise RuntimeError(
+                            f"tilt abort: pitch {pitch_now:+.1f}deg roll {roll_now:+.1f}deg "
+                            f"(limit {np.rad2deg(tilt_abort_rad):.0f}deg) {tick - policy_start:.2f}s into the policy stage")
                 timing_rows.append(timing_row(tick, "policy",
                                               timing_rows[-1][0] if timing_rows and timing_rows[-1][1] == "policy" else None,
                                               t265_sample))
@@ -1900,6 +1969,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                     last_policy_progress = progress
                 last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
         except RuntimeError as error:
+            set_gain_scale(1.0)
             if soft_stop_s and is_soft_stop_abort(error):
                 print(f"ABORT in the policy stage: {error}")
                 abort_message = f"{type(error).__name__}: {error}"
@@ -1939,6 +2009,7 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
     finally:
         # Cleanup must never be skipped, including a stale-feedback or USB-open
         # failure.  Attempt all shutdown steps even if one of them fails.
+        set_gain_scale(1.0)
         if abort_message is not None and csv_path is not None:
             try:
                 path = abort_txt_path(csv_path)
@@ -2075,6 +2146,27 @@ def report_timing_csv(path):
         last = gate[-1]
         print(f"TILT at the policy switch: pitch {float(last[8]):+.1f}deg (+ = forward), "
               f"roll {float(last[9]):+.1f}deg")
+    print(policy_start_line(records))
+
+
+def policy_start_line(records):
+    """D10-13E: how the first second of the policy stage went, from _timing.csv rows."""
+    policy = [(float(r[0]), float(r[8])) for r in records if r[1] == "policy"]
+    if not policy:
+        return "POLICY START: no policy stage."
+    t0 = policy[0][0]
+    times = np.array([t - t0 for t, _ in policy]); pitch = np.array([p for _, p in policy])
+    def at(t):
+        i = int(np.searchsorted(times, t))
+        return f"{pitch[i]:+.1f}" if i < len(times) else "-"
+    first = times <= 0.5
+    peak = int(np.argmax(np.abs(np.where(first, pitch, 0.0))))
+    after = pitch[peak:]
+    back = float(after.min() if pitch[peak] >= 0 else after.max())
+    return (f"POLICY START: {times[-1] + 0.02:.2f}s of policy; pitch at 0/0.1/0.2/0.3/0.5/1.0s = "
+            + "/".join(at(t) for t in (0.0, 0.1, 0.2, 0.3, 0.5, 1.0))
+            + f" deg; peak |pitch| in 0.5s {pitch[peak]:+.1f}deg at {times[peak]:.2f}s, "
+            f"came back to {back:+.1f}deg; max |pitch| overall {np.max(np.abs(pitch)):.1f}deg")
 
 
 def enable_fine_timer():
@@ -2403,6 +2495,9 @@ def main():
     p.add_argument('--zero-offset', choices=sorted(ZERO_OFFSET_PRESETS_DEG), help='D10-13D, with --all-axes: map the D7 origin (legs straight by eye) to the sim joint zero (CAD pose) with a fixed per-joint offset; see ZERO_OFFSET_PRESETS_DEG')
     p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
+    p.add_argument('--origin-ref', choices=('d7', 'stand'), default='d7', help='D10-13E, with --walk-limits: measure the 45 deg origin abort from the D7 origin (default) or from the stand pose; stand keeps a 75 deg D7 backstop and a knee hyperextension stop, and requires --tilt-abort-deg')
+    p.add_argument('--tilt-abort-deg', type=float, help=f'D10-13E, with --walk-limits: end the policy stage when the T265 |pitch| or |roll| exceeds this ({TILT_ABORT_MIN_DEG:g} <= value <= {TILT_ABORT_MAX_DEG:g}); a soft stop follows if armed')
+    p.add_argument('--policy-gain-scale', type=float, help=f'D10-13E, with --walk-limits: Kp and Kd x this in the policy stage only ({POLICY_GAIN_SCALE_MIN:g} <= value <= {POLICY_GAIN_SCALE_MAX:g}); stand hold, gate and soft stop keep full gains')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -2447,6 +2542,18 @@ def main():
             p.error('--start-gate-deg is for the floor walking run: pass --walk-limits')
         if not START_GATE_MIN_DEG <= a.start_gate_deg <= START_GATE_MAX_DEG:
             p.error(f'--start-gate-deg must satisfy {START_GATE_MIN_DEG:g} <= value <= {START_GATE_MAX_DEG:g}')
+    for flag, value in (("--tilt-abort-deg", a.tilt_abort_deg), ("--policy-gain-scale", a.policy_gain_scale)):
+        if value is not None and not a.walk_limits:
+            p.error(f'{flag} is for the floor walking run: pass --walk-limits')
+    if a.origin_ref == 'stand':
+        if not a.walk_limits:
+            p.error('--origin-ref stand is for the floor walking run: pass --walk-limits')
+        if a.tilt_abort_deg is None:
+            p.error('--origin-ref stand loosens the origin abort; it requires --tilt-abort-deg')
+    if a.tilt_abort_deg is not None and not TILT_ABORT_MIN_DEG <= a.tilt_abort_deg <= TILT_ABORT_MAX_DEG:
+        p.error(f'--tilt-abort-deg must satisfy {TILT_ABORT_MIN_DEG:g} <= value <= {TILT_ABORT_MAX_DEG:g}')
+    if a.policy_gain_scale is not None and not POLICY_GAIN_SCALE_MIN <= a.policy_gain_scale <= POLICY_GAIN_SCALE_MAX:
+        p.error(f'--policy-gain-scale must satisfy {POLICY_GAIN_SCALE_MIN:g} <= value <= {POLICY_GAIN_SCALE_MAX:g}')
     if a.soft_stop_seconds is not None and not 0 < a.soft_stop_seconds <= SOFT_STOP_MAX_S:
         p.error(f'--soft-stop-seconds must satisfy 0 < value <= {SOFT_STOP_MAX_S:g}')
     limits = (walk_current_limits() if a.walk_limits
@@ -2458,8 +2565,15 @@ def main():
             + f"; speed abort {walk_speed_dps:.0f}deg/s; slew allowed up to "
             f"{WALK_POLICY_SLEW_MAX_DPS:g}deg/s. Keep the hoist rope attached.")
         if a.soft_stop_seconds is not None:
-            print(f"SOFT STOP armed: after a speed/current/origin abort in the policy stage, "
+            print(f"SOFT STOP armed: after a speed/current/origin/tilt abort in the policy stage, "
                   f"hold where it stopped for {a.soft_stop_seconds:g}s, then zero MIT.")
+        if a.origin_ref == 'stand':
+            print(f"ORIGIN REF stand: origin abort at {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg from the stand pose; "
+                  f"backstop {ORIGIN_BACKSTOP_DEG:g}deg from D7; knee past straight > {KFE_HYPEREXTEND_DEG:g}deg aborts.")
+        if a.tilt_abort_deg is not None:
+            print(f"TILT ABORT armed: policy stage ends at |pitch| or |roll| > {a.tilt_abort_deg:g}deg (T265).")
+        if a.policy_gain_scale is not None:
+            print(f"POLICY GAIN SCALE planned: Kp/Kd x{a.policy_gain_scale:g} in the policy stage only.")
     elif a.floor_limits:
         print("FLOOR LIMITS: per-axis current abort " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS))
@@ -2674,5 +2788,8 @@ def main():
         command_delay_s=a.command_delay_seconds,
         soft_stop_s=a.soft_stop_seconds,
         start_gate_rad=None if a.start_gate_deg is None else float(np.deg2rad(a.start_gate_deg)),
-        fine_timer=a.fine_timer)
+        fine_timer=a.fine_timer,
+        origin_ref_stand=(a.origin_ref == 'stand'),
+        tilt_abort_rad=None if a.tilt_abort_deg is None else float(np.deg2rad(a.tilt_abort_deg)),
+        policy_gain_scale=a.policy_gain_scale)
 if __name__=='__main__': sys.exit(main() or 0)
