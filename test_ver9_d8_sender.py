@@ -1737,3 +1737,68 @@ class AutoLeanWalkTests(unittest.TestCase):
         # The first policy tick slews from the LEANED pose toward the policy target (the sim default).
         self.assertGreater(np.rad2deg(float(first_policy["requested_target_rad"])),
                            np.rad2deg(sender.STAND_TARGET[sender.ffe_indices()[0]]) + 8.0 - 3.1)
+
+
+class FloorWalkTests(unittest.TestCase):
+    """D10-13 (2026-09-23): longer policy stage and a delayed velocity command."""
+
+    _WALK = ["ver9_d8_sender.py", "--arm", "--all-axes", "--walk-limits", "--stand-seconds", "15",
+             "--policy-slew-dps", "200", "--package", "x", "--ramp-seconds", "10",
+             "--csv", "x.csv", "--vx", "0.2"]
+
+    def _main(self, argv):
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            sender.main()
+        return run.call_args.kwargs
+
+    def test_walk_allows_15_seconds_and_a_delay(self):
+        kw = self._main(self._WALK + ["--duration", "15", "--command-delay-seconds", "2"])
+        self.assertEqual(kw["command_delay_s"], 2.0)
+        self.assertEqual(kw["current_limits"], sender.walk_current_limits())
+
+    def test_refusals(self):
+        floor = [a if a != "--walk-limits" else "--floor-limits" for a in self._WALK]
+        floor[floor.index("200")] = "60"
+        bad = [
+            self._WALK + ["--duration", "16"],
+            floor + ["--duration", "10"],
+            floor + ["--duration", "5", "--command-delay-seconds", "2"],
+            self._WALK + ["--duration", "10", "--command-delay-seconds", "6"],
+            self._WALK + ["--duration", "2", "--command-delay-seconds", "2"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+        self.assertIsNone(self._main(floor + ["--duration", "5"])["command_delay_s"])
+
+    def test_run_sends_zero_then_the_command(self):
+        import contextlib
+        seen = []
+        first = SimpleNamespace(joint_target_h_order=sender.STAND_TARGET, action_raw=np.zeros(10))
+
+        def fake_eval(policy, t265, feedback, command, last):
+            seen.append((command.vx, command.vy, command.wz) if hasattr(command, "vx")
+                        else tuple(getattr(command, f) for f in command._fields[1:4]))
+            return None, None, first, None
+        with tempfile.TemporaryDirectory() as directory:
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", AllAxesSlewTests._fake_bus(None, [])), \
+                    patch.object(sender, "RealT265", AllAxesSlewTests._FakeT265), \
+                    patch.object(sender, "evaluate_cycle", side_effect=fake_eval), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.3, Path(directory) / "w.csv", 0.2, 0.0, 0.0,
+                           transmit=True, ramp_seconds=0.05, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.walk_current_limits(),
+                           policy_slew_rad_s=np.deg2rad(200.0), stand_seconds=0.05,
+                           speed_abort_rad_s=np.deg2rad(200.0), command_delay_s=0.15)
+        policy_calls = seen[1:]           # the first call is the pre-arm evaluation
+        self.assertTrue(policy_calls)
+        self.assertEqual(policy_calls[0][0], 0.0)
+        self.assertEqual(policy_calls[-1][0], 0.2)
+        self.assertIn("COMMAND DELAY", buffer.getvalue())
+        self.assertIn("COMMAND: vx=+0.20", buffer.getvalue())

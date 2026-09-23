@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_12_AUTOLEAN_WALK_20260923_1730"
+BUILD_ID = "D10_13_FLOORWALK_20260923_1800"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -146,6 +146,12 @@ WALK_CURRENT_ABORT_A_BY_JOINT = {
 }
 WALK_SPEED_ABORT_RAD_S = float(np.deg2rad(200.0))
 WALK_POLICY_SLEW_MAX_DPS = 200.0
+# D10-13 (2026-09-23): the walking run itself.  With --walk-limits the policy
+# stage may last up to WALK_DURATION_MAX_S, and --command-delay-seconds keeps
+# the velocity command at zero for the first seconds of the policy stage so
+# the policy first catches its balance on the floor, then walks.
+WALK_DURATION_MAX_S = 15.0
+COMMAND_DELAY_MAX_S = 5.0
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -1516,7 +1522,7 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits)
     if speed_abort_rad_s is not None:
@@ -1724,9 +1730,19 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                   f"from the {'stand pose' if stand_seconds else 'frozen ramp target'} toward the live policy output.")
         previous_policy_tick = time.monotonic()
         last_policy_progress = -1
+        policy_start = time.monotonic()
+        zero_cmd = FixedCommandSource(0.0, 0.0, 0.0)
+        command_started = False
+        if command_delay_s is not None:
+            print(f"COMMAND DELAY: zero command for the first {command_delay_s:g}s of the policy stage.")
         while time.monotonic()<end:
             time.sleep(max(0,nxt-time.monotonic())); tick=time.monotonic()
-            _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),cmd.sample(tick),last)
+            use_cmd = cmd if (command_delay_s is None or tick - policy_start >= command_delay_s) else zero_cmd
+            if command_delay_s is not None and not command_started and use_cmd is cmd:
+                print(f"COMMAND: vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f} from now "
+                      f"({tick - policy_start:.2f}s into the policy stage).")
+                command_started = True
+            _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),use_cmd.sample(tick),last)
             if _o is not None:
                 obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
             desired_target = out.joint_target_h_order[selected_index]
@@ -2038,6 +2054,7 @@ def main():
     p.add_argument('--lean-sweep-deg', type=float, help=f'D10-11, with --floor-limits --stand-only: after the stand hold, add toe-down lean to both FFE at {LEAN_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {LEAN_SWEEP_MAX_DEG:g}) and log where the robot balances over its ankles')
     p.add_argument('--auto-lean-deg', type=float, help=f'D10-12, with --floor-limits or --walk-limits and --stand-seconds >= {AUTO_LEAN_START_S + 4:g}: from {AUTO_LEAN_START_S:g}s into the stand hold, lean both FFE toe-down until the ankles stop being pushed toe-up (0 < max <= {STAND_LEAN_MAX_DEG:g} deg); the policy starts from the leaned pose')
     p.add_argument('--walk-limits', action='store_true', help=f'D10-12, policy on the floor with the hoist rope attached: --floor-limits with KFE/FFE {WALK_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} A, speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} deg/s, --policy-slew-dps allowed up to {WALK_POLICY_SLEW_MAX_DPS:g}. Needs explicit user approval')
+    p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -2095,6 +2112,13 @@ def main():
               "(AK10-9 42.1A, AK80-9 25.8A). Speed abort, stale feedback, motor "
               "error and origin aborts are unchanged.")
     slew_max = WALK_POLICY_SLEW_MAX_DPS if a.walk_limits else POLICY_SLEW_MAX_DPS
+    if a.command_delay_seconds is not None:
+        if not a.walk_limits:
+            p.error('--command-delay-seconds is for the floor walking run: pass --walk-limits')
+        if not 0 < a.command_delay_seconds <= COMMAND_DELAY_MAX_S:
+            p.error(f'--command-delay-seconds must satisfy 0 < value <= {COMMAND_DELAY_MAX_S:g}')
+        if a.command_delay_seconds >= a.duration:
+            p.error('--command-delay-seconds must be shorter than --duration')
     if a.policy_slew_dps is not None:
         if not a.arm or not a.all_axes or a.hold_pose or a.static_probe:
             p.error('--policy-slew-dps is only for a whole-body policy run: --arm --all-axes, '
@@ -2225,7 +2249,11 @@ def main():
         return 0
     if a.stand_only:
         if not a.csv: p.error('--csv is required with --arm')
-    elif not a.csv or not 0<a.duration<=5: p.error('--csv and 0<--duration<=5 are required with --arm')
+    else:
+        duration_max = WALK_DURATION_MAX_S if a.walk_limits else 5.0
+        if not a.csv or not 0 < a.duration <= duration_max:
+            p.error(f'--csv and 0<--duration<={duration_max:g} are required with --arm'
+                    + ('' if a.walk_limits else f' ({WALK_DURATION_MAX_S:g} only with --walk-limits)'))
     if a.ramp_seconds is None or a.ramp_seconds <= 0: p.error('--arm requires a positive --ramp-seconds value')
     if a.all_axes:
         # Every axis at once is the whole-body step.  It is deliberate and
@@ -2254,5 +2282,6 @@ def main():
         stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target,
         haa_close_rad=haa_close_rad, lean_sweep_rad=lean_sweep_rad,
         auto_lean_rad=auto_lean_rad,
-        speed_abort_rad_s=WALK_SPEED_ABORT_RAD_S if a.walk_limits else None)
+        speed_abort_rad_s=WALK_SPEED_ABORT_RAD_S if a.walk_limits else None,
+        command_delay_s=a.command_delay_seconds)
 if __name__=='__main__': sys.exit(main() or 0)
