@@ -662,7 +662,7 @@ class AllAxesFlagTests(unittest.TestCase):
     ]
 
     def test_all_axes_drives_every_registered_axis(self):
-        with patch.object(sys, "argv", self._BASE + ["--all-axes"]), \
+        with patch.object(sys, "argv", self._BASE + ["--all-axes", "--policy-slew-dps", "30"]), \
                 patch.object(sender, "run") as run:
             sender.main()
         self.assertEqual(run.call_args.kwargs["motor_ids"], sender.H_CAN_IDS)
@@ -920,3 +920,203 @@ class HoldPoseRunTests(unittest.TestCase):
         self.assertEqual({line.split(",")[3] for line in body},
                          {line.split(",")[4] for line in body})
         self.assertEqual(set(sent), set(sender.H_CAN_IDS))
+
+
+class AllAxesSlewTests(unittest.TestCase):
+    """D10-4: every axis is slew-limited after the ramp, and the gate refuses
+    a frozen target the open-loop ramp must not chase."""
+
+    _BASE = [
+        "ver9_d8_sender.py", "--arm", "--all-axes", "--package", "pkg",
+        "--ramp-seconds", "15", "--duration", "3", "--csv", "out.csv",
+    ]
+
+    def test_all_axes_policy_run_requires_policy_slew(self):
+        with patch.object(sys, "argv", self._BASE), \
+                patch.object(sender, "run") as run:
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+
+    def test_policy_slew_is_passed_in_radians(self):
+        with patch.object(sys, "argv", self._BASE + ["--policy-slew-dps", "30"]), \
+                patch.object(sender, "run") as run:
+            sender.main()
+        self.assertAlmostEqual(run.call_args.kwargs["policy_slew_rad_s"],
+                               np.deg2rad(30.0))
+
+    def test_policy_slew_range_is_enforced(self):
+        for value in ("0", "-5", "61"):
+            with patch.object(sys, "argv", self._BASE + ["--policy-slew-dps", value]), \
+                    patch.object(sender, "run") as run:
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_policy_slew_refused_without_all_axes_or_with_hold_pose(self):
+        single = ["ver9_d8_sender.py", "--arm", "--package", "pkg", "--motor-id", "0x1C",
+                  "--ramp-seconds", "15", "--duration", "2", "--csv", "o.csv",
+                  "--policy-slew-dps", "30"]
+        hold = ["ver9_d8_sender.py", "--arm", "--all-axes", "--hold-pose",
+                "--duration", "2", "--csv", "o.csv", "--policy-slew-dps", "30"]
+        for argv in (single, hold):
+            with patch.object(sys, "argv", argv), \
+                    patch.object(sender, "run") as run, \
+                    patch.object(sender, "run_hold_pose") as hold_run:
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+            hold_run.assert_not_called()
+
+    def test_single_axis_run_keeps_its_old_behaviour(self):
+        argv = ["ver9_d8_sender.py", "--arm", "--package", "pkg", "--motor-id", "0x1C",
+                "--ramp-seconds", "15", "--duration", "2", "--csv", "o.csv"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run:
+            sender.main()
+        self.assertIsNone(run.call_args.kwargs["policy_slew_rad_s"])
+
+    def test_slew_all_limits_every_axis_independently(self):
+        previous = tuple(0.0 for _ in range(10))
+        desired = tuple((-1.0) ** i * 0.5 for i in range(10))
+        got = sender.slew_all(previous, desired, np.deg2rad(30.0), 0.02)
+        step = np.deg2rad(30.0) * 0.02
+        for value, want in zip(got, desired):
+            self.assertAlmostEqual(abs(value), step)
+            self.assertEqual(np.sign(value), np.sign(want))
+
+    def test_prearm_gate_flags_large_target_or_delta(self):
+        positions = tuple(0.0 for _ in range(10))
+        ok = tuple(np.deg2rad(20.0) for _ in range(10))
+        self.assertEqual(sender.all_axes_prearm_violations(ok, positions), [])
+        big_delta = list(ok); big_delta[9] = np.deg2rad(-37.3)   # D10-3 R4, 0x22
+        self.assertEqual(len(sender.all_axes_prearm_violations(big_delta, positions)), 1)
+        far = list(positions); far_t = list(ok)
+        far[8] = np.deg2rad(-30.0); far_t[8] = np.deg2rad(-45.0)  # |target|>40, delta 15
+        self.assertEqual(len(sender.all_axes_prearm_violations(far_t, far)), 1)
+
+    def _fake_bus(self, sent):
+        class FakeBus:
+            tx_count = 0
+
+            def __init__(self, current_limits=None):
+                self.current_limit_a = dict(current_limits or {})
+
+            def open(self):
+                return None
+
+            def discover_routes(self):
+                return None
+
+            def feedback(self):
+                return {mid: sender.MotorFeedback(mid, 0.0, 0.0, 0.0)
+                        for mid in sender.H_CAN_IDS}
+
+            def state(self, _mid):
+                return SimpleNamespace(pos=0.0, spd=0.0, cur=0.1, err=0,
+                                       t=__import__("time").time())
+
+            def send(self, frame):
+                sent.append(frame)
+
+            def snapshot(self):
+                return []
+
+            def zero(self):
+                return None
+
+            def close(self):
+                return None
+        return FakeBus
+
+    class _FakeT265:
+        def __init__(self, _offset):
+            pass
+
+        def start(self):
+            return None
+
+        def latest(self):
+            return object()
+
+        def close(self):
+            return None
+
+    def test_policy_stage_never_steps_any_axis(self):
+        import contextlib
+        sent = []
+        first = SimpleNamespace(joint_target_h_order=(0.1,) * 10, action_raw=np.zeros(10))
+        # The live policy then asks for a 23 deg step on every axis.
+        step = SimpleNamespace(joint_target_h_order=(0.5,) * 10, action_raw=np.zeros(10))
+        outputs = iter([first] + [step] * 1000)
+        rate = np.deg2rad(30.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "slew.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", self._fake_bus(sent)), \
+                    patch.object(sender, "RealT265", self._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 side_effect=lambda *a, **k: (None, None, next(outputs), None)), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.2, path, 0.0, 0.0, 0.0, transmit=True,
+                           ramp_seconds=0.1, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.gravity_current_limits(),
+                           policy_slew_rad_s=rate)
+            import csv as _csv
+            rows = list(_csv.DictReader(path.open(encoding="utf-8")))
+        policy = [r for r in rows if r["stage"] == "policy"]
+        self.assertTrue(policy)
+        self.assertEqual({r["sent_motor_id"] for r in policy},
+                         {f"0x{m:02X}" for m in sender.H_CAN_IDS})
+        by_axis = {}
+        for r in policy:
+            by_axis.setdefault(r["sent_motor_id"], []).append(r)
+        for axis in by_axis.values():
+            previous_tick, previous = None, 0.1
+            for r in axis:
+                tick, requested = float(r["tick"]), float(r["requested_target_rad"])
+                # First policy tick starts from the frozen ramp target.
+                bound = rate * ((tick - previous_tick) if previous_tick else 0.2) + 1e-9
+                self.assertLessEqual(abs(requested - previous), bound)
+                self.assertLess(requested, 0.5)
+                previous_tick, previous = tick, requested
+        self.assertIn("SLEW GAP", buffer.getvalue())
+
+    def test_prearm_gate_refuses_before_any_mit_frame(self):
+        import contextlib
+        sent = []
+        bad = SimpleNamespace(joint_target_h_order=(0.1,) * 9 + (np.deg2rad(-63.8),),
+                              action_raw=np.zeros(10))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate.csv"
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", self._fake_bus(sent)), \
+                    patch.object(sender, "RealT265", self._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 return_value=(None, None, bad, None)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "PRE-ARM GATE"):
+                    sender.run(Path(directory), 1.0, path, 0.0, 0.0, 0.0, transmit=True,
+                               ramp_seconds=15, motor_ids=sender.H_CAN_IDS,
+                               current_limits=sender.gravity_current_limits(),
+                               policy_slew_rad_s=np.deg2rad(30.0))
+        self.assertEqual(sent, [])
+
+    def test_analyze_uses_the_frozen_ramp_target(self):
+        import contextlib
+        rows = ["tick,stage,sent_motor_id,desired_target_rad,requested_target_rad,"
+                "wire_target_rad,feedback_position_rad,feedback_velocity_rad_s,feedback_current_a"]
+        for tick in range(5):
+            for mid in sender.H_CAN_IDS:
+                rows.append(f"{tick*0.02},ramp,0x{mid:02X},-0.2,{-0.04*tick},0,0,0,0.1")
+        for mid in sender.H_CAN_IDS:
+            rows.append(f"0.2,policy,0x{mid:02X},0.3,-0.2,0,0,0,0.1")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.csv"
+            path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                sender.analyze_csv(path)
+        text = buffer.getvalue()
+        self.assertIn("asked= -11.46deg", text)
+        self.assertIn("POLICY STAGE: 1 tick(s)", text)
