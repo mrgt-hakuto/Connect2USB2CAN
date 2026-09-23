@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_10_FLOORSTAND_20260923_1600"
+BUILD_ID = "D10_11_LEANSWEEP_20260923_1700"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -99,6 +99,27 @@ FLOOR_CURRENT_ABORT_A_BY_JOINT = {
     "KFE":  6.0,   # static stance estimate <= 3.9 A
     "FFE":  6.0,   # static stance estimate <= 4.7 A (CoP 5 cm ahead of the ankle)
 }
+# D10-11 (2026-09-23): on the floor at the sim default pose the robot tipped
+# BACKWARD in every run (R1 stand, R2 x2 with the policy), although
+# robot_sim.urdf puts the whole-body CoM 1.5 cm AHEAD of the ankles there.  The
+# URDF masses were back-calculated from density, so the real CoM is not known.
+# Two knobs, both keeping the sole parallel to the body when hanging:
+#   --stand-knee-deg K : HFE = -K/2, KFE = +K, FFE = -K/2 (sim default is K=20)
+#   --stand-lean-deg L : add L to both FFE targets.  FFE + is toe DOWN; with the
+#                        sole flat on the floor that tips the shank, and the
+#                        whole robot, FORWARD by L.
+# --lean-sweep-deg adds the lean slowly on the floor and logs where the ankles
+# stop carrying a backward-tipping torque: FFE feedback lags its target on the
+# toe-UP side while the robot leans back on its heels, and on the toe-DOWN side
+# once it leans forward.  The zero crossing of that error is the lean at which
+# the CoM is over the ankles.  The error, not the current, is used: the logged
+# AK80-9 current sign does not follow the error consistently (D10-10 logs).
+STAND_KNEE_MAX_DEG = 30.0
+STAND_LEAN_MIN_DEG = -5.0
+STAND_LEAN_MAX_DEG = 8.0
+LEAN_SWEEP_DPS = 0.5
+LEAN_SWEEP_MAX_DEG = 10.0
+LEAN_SWEEP_HOLD_S = 3.0
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -357,6 +378,138 @@ def gravity_current_limits():
     """Per-axis limits that clear this robot's own static gravity load."""
     return {mid: GRAVITY_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)]
             for mid in H_CAN_IDS}
+
+
+def stand_pose_target(knee_deg=None, lean_deg=0.0):
+    """The stand pose: sim default, or a flat-foot crouch of knee_deg, plus a lean on FFE."""
+    out = list(STAND_TARGET)
+    for index, mid in enumerate(H_CAN_IDS):
+        suffix = joint_suffix(mid)
+        if knee_deg is not None:
+            if suffix == "KFE":
+                out[index] = float(np.deg2rad(knee_deg))
+            elif suffix in ("HFE", "FFE"):
+                out[index] = float(np.deg2rad(-knee_deg / 2.0))
+        if suffix == "FFE":
+            out[index] += float(np.deg2rad(lean_deg))
+    return tuple(out)
+
+
+def ffe_indices():
+    """H-order indices of LL_FFE and LR_FFE."""
+    return tuple(H_CAN_IDS.index(mid) for mid in H_CAN_IDS if joint_suffix(mid) == "FFE")
+
+
+def lean_sweep_targets(stand_target, max_rad, elapsed_s, rate_rad_s=None):
+    """The stand pose with both FFE moved toe-down (positive H) by the swept lean."""
+    rate = float(np.deg2rad(LEAN_SWEEP_DPS)) if rate_rad_s is None else rate_rad_s
+    lean = min(abs(max_rad), rate * max(elapsed_s, 0.0))
+    out = list(stand_target)
+    for index in ffe_indices():
+        out[index] = stand_target[index] + lean
+    return tuple(out)
+
+
+def lean_balance_deg(leans_deg, errors_deg):
+    """Interpolated lean where the mean FFE error (target - feedback) first falls through 0."""
+    for i in range(1, len(leans_deg)):
+        a, b = errors_deg[i - 1], errors_deg[i]
+        if a > 0 >= b:
+            if a == b:
+                return leans_deg[i]
+            return leans_deg[i - 1] + (leans_deg[i] - leans_deg[i - 1]) * a / (a - b)
+    return None
+
+
+def report_lean_sweep(rows):
+    """What the lean sweep found, per 1-degree bin of added lean (live and --analyze)."""
+    sweep = [row for row in rows if row[1] in ("lean-sweep", "lean-hold")]
+    stand = [row for row in rows if row[1] == "stand-hold"]
+    if not sweep or not stand:
+        return None
+    ffe = ffe_indices()
+    base = {}
+    for index in ffe:
+        label = f"0x{H_CAN_IDS[index]:02X}"
+        base[index] = next(row[4] for row in stand if row[2] == label)
+    ticks = sorted(set(row[0] for row in sweep))
+    by_tick = {}
+    for row in sweep:
+        by_tick.setdefault(row[0], {})[row[2]] = row
+    bins = {}
+    for tick in ticks:
+        entry = by_tick[tick]
+        leans, errors = [], []
+        for index in ffe:
+            row = entry.get(f"0x{H_CAN_IDS[index]:02X}")
+            if row is None:
+                break
+            leans.append(np.rad2deg(row[4] - base[index]))
+            errors.append(np.rad2deg(row[4] - row[6]))
+        else:
+            key = int(np.floor(np.mean(leans) + 1e-6))
+            currents = {suffix: max(abs(r[8]) for mid_label, r in entry.items()
+                                    if joint_suffix(int(mid_label, 16)) == suffix)
+                        for suffix in ("HFE", "KFE", "FFE")}
+            bins.setdefault(key, []).append((np.mean(leans), errors[0], errors[1], currents))
+    print(f"LEAN SWEEP (D10-11): both FFE toe-down at {LEAN_SWEEP_DPS:g}deg/s on the floor. "
+          "err = target - feedback; + = pushed toe-UP (robot on its heels, tipping back), "
+          "- = pushed toe-DOWN (tipping forward).")
+    xs, ys = [], []
+    for key in sorted(bins):
+        values = bins[key]
+        lean = float(np.mean([v[0] for v in values]))
+        ll = float(np.mean([v[1] for v in values]))
+        lr = float(np.mean([v[2] for v in values]))
+        cur = {suffix: max(v[3][suffix] for v in values) for suffix in ("HFE", "KFE", "FFE")}
+        xs.append(lean)
+        ys.append((ll + lr) / 2.0)
+        print(f"  lean {lean:+5.1f}deg: FFE err L/R {ll:+5.1f}/{lr:+5.1f}deg (mean {ys[-1]:+5.1f}); "
+              f"max|I| HFE {cur['HFE']:.2f}A KFE {cur['KFE']:.2f}A FFE {cur['FFE']:.2f}A")
+    balance = lean_balance_deg(xs, ys)
+    if balance is None:
+        print(f"BALANCE LEAN: not crossed; mean FFE err {ys[0]:+.1f}deg at lean {xs[0]:+.1f}, "
+              f"{ys[-1]:+.1f}deg at lean {xs[-1]:+.1f}.")
+    else:
+        print(f"BALANCE LEAN: {balance:+.1f}deg (mean FFE error crosses 0 here). "
+              f"Use --stand-lean-deg {int(round(balance))} for the next stand.")
+    return balance
+
+
+def run_lean_sweep(bus, rows, stand_target, max_rad, motor_ids):
+    """D10-11: lean the standing robot forward through its ankles, slowly."""
+    rate = float(np.deg2rad(LEAN_SWEEP_DPS))
+    print(f"LEAN SWEEP: both FFE toe-down by up to {np.rad2deg(abs(max_rad)):.1f}deg at "
+          f"{LEAN_SWEEP_DPS:g}deg/s. Support only from the SIDES; do not hold it front/back.")
+    start = time.monotonic()
+    nxt = start
+    hold_end = None
+    last_second = -1
+    first = ffe_indices()[0]
+    while True:
+        time.sleep(max(0, nxt - time.monotonic()))
+        tick = time.monotonic()
+        feedback = bus.feedback()
+        targets = lean_sweep_targets(stand_target, max_rad, tick - start, rate)
+        sweeping = tick - start < abs(max_rad) / rate
+        if not sweeping and hold_end is None:
+            print(f"LEAN SWEEP reached +{np.rad2deg(abs(max_rad)):.1f}deg; holding {LEAN_SWEEP_HOLD_S:g}s.")
+            hold_end = tick + LEAN_SWEEP_HOLD_S
+        for fr in frames(targets, motor_ids):
+            bus.send(fr)
+        rows.extend(axis_rows(tick, "lean-sweep" if sweeping else "lean-hold",
+                              targets, targets, bus, motor_ids))
+        second = int(tick - start)
+        if sweeping and second != last_second:
+            print(f"LEAN SWEEP progress: {second}s; lean=+{np.rad2deg(targets[first] - stand_target[first]):.1f}deg; "
+                  + ", ".join(f"{H_BINDING_BY_ID[H_CAN_IDS[i]].name} err="
+                              f"{np.rad2deg(targets[i] - feedback[H_CAN_IDS[i]].position):+.1f}deg"
+                              for i in ffe_indices()))
+            last_second = second
+        if hold_end is not None and tick >= hold_end:
+            break
+        nxt += PERIOD
+    return report_lean_sweep(rows)
 
 
 def floor_current_limits():
@@ -1322,7 +1475,7 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
@@ -1488,6 +1641,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                              stand_target, motor_ids, current_limits)
             if haa_close_rad:
                 run_haa_sweep(bus, rows, stand_target, haa_close_rad, motor_ids)
+            if lean_sweep_rad:
+                run_lean_sweep(bus, rows, stand_target, lean_sweep_rad, motor_ids)
             if stand_only:
                 print("STAND ONLY: no policy stage. Sending zero MIT cleanup.")
                 return
@@ -1748,13 +1903,16 @@ def analyze_csv(csv_path):
                     if axis_stand:
                         stand_target[H_CAN_IDS.index(mid)] = axis_stand[0][3]
                 stand_target = tuple(stand_target)
-                label = "sim default pose" if np.allclose(stand_target, STAND_TARGET) else "sign pose"
+                label = ("sim default pose" if np.allclose(stand_target, STAND_TARGET)
+                         else "sign pose" if np.allclose(stand_target, SIGN_POSE_TARGET)
+                         else "custom stand pose (--stand-knee-deg / --stand-lean-deg)")
                 print(f"STAND HOLD ({label}):")
                 print_look_check(stand_target)
                 report_hold_pose(stand, stand_target, logged_ids, default_current_limits())
             report_all_axes(rows, positions, targets, logged_ids)
             report_slew_gap(rows, logged_ids)
             report_haa_sweep(rows)
+            report_lean_sweep(rows)
         sidecar = obs_csv_path(csv_path)
         if sidecar.exists():
             report_observation(sidecar)
@@ -1808,6 +1966,9 @@ def main():
     p.add_argument('--stand-seconds', type=float, help=f'with --arm --all-axes: ramp to the sim default pose (HAA 0, HFE -10, KFE +20, FFE -10 deg) over --ramp-seconds, hold it this long (0 < value <= {STAND_MAX_SECONDS:g}), then start the slew-limited policy from there')
     p.add_argument('--sign-pose', action='store_true', help=f'with --stand-only (D10-7): hold the sim default pose plus {SIGN_POSE_EXTRA_DEG:g} deg outward on HR and HAA of both legs, so every joint sign can be checked by eye')
     p.add_argument('--haa-close-deg', type=float, help=f'with --stand-only (D10-9): after the stand hold, move BOTH HAA inward together at {HAA_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {HAA_CLOSE_MAX_DEG:g}) and log the angle at which the feet stop each other; both HAA freeze there')
+    p.add_argument('--stand-knee-deg', type=float, help=f'D10-11: stand pose HFE=-K/2, KFE=+K, FFE=-K/2 (sole parallel to the body) instead of the sim default (K=20); 0 <= K <= {STAND_KNEE_MAX_DEG:g}')
+    p.add_argument('--stand-lean-deg', type=float, help=f'D10-11: add this many deg to both FFE stand targets (+ = toe down = robot leans FORWARD once the sole is flat on the floor); {STAND_LEAN_MIN_DEG:g} <= L <= {STAND_LEAN_MAX_DEG:g}')
+    p.add_argument('--lean-sweep-deg', type=float, help=f'D10-11, with --floor-limits --stand-only: after the stand hold, add toe-down lean to both FFE at {LEAN_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {LEAN_SWEEP_MAX_DEG:g}) and log where the robot balances over its ankles')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -1883,6 +2044,30 @@ def main():
               f"({a.haa_close_deg / HAA_SWEEP_DPS:.1f}s), stop and freeze at the first block.")
     haa_close_rad = None if a.haa_close_deg is None else float(np.deg2rad(a.haa_close_deg))
     stand_target = SIGN_POSE_TARGET if a.sign_pose else STAND_TARGET
+    lean_sweep_rad = None
+    if a.stand_knee_deg is not None or a.stand_lean_deg is not None or a.lean_sweep_deg is not None:
+        if a.stand_seconds is None or a.sign_pose or a.haa_close_deg is not None:
+            p.error('--stand-knee-deg/--stand-lean-deg/--lean-sweep-deg shape the stand pose: they need '
+                    '--stand-seconds and cannot be combined with --sign-pose or --haa-close-deg')
+        if a.stand_knee_deg is not None and not 0 <= a.stand_knee_deg <= STAND_KNEE_MAX_DEG:
+            p.error(f'--stand-knee-deg must satisfy 0 <= value <= {STAND_KNEE_MAX_DEG:g}')
+        if a.stand_lean_deg is not None and not STAND_LEAN_MIN_DEG <= a.stand_lean_deg <= STAND_LEAN_MAX_DEG:
+            p.error(f'--stand-lean-deg must satisfy {STAND_LEAN_MIN_DEG:g} <= value <= {STAND_LEAN_MAX_DEG:g}')
+        if a.lean_sweep_deg is not None:
+            if not (a.floor_limits and a.stand_only):
+                p.error('--lean-sweep-deg is a floor balance check: it needs --floor-limits and --stand-only')
+            if not 0 < a.lean_sweep_deg <= LEAN_SWEEP_MAX_DEG:
+                p.error(f'--lean-sweep-deg must satisfy 0 < value <= {LEAN_SWEEP_MAX_DEG:g}')
+            lean_sweep_rad = float(np.deg2rad(a.lean_sweep_deg))
+        stand_target = stand_pose_target(a.stand_knee_deg, a.stand_lean_deg or 0.0)
+        print("STAND POSE (D10-11): " + ", ".join(
+            f"{H_BINDING_BY_ID[mid].name}={np.rad2deg(t):+.1f}deg"
+            for mid, t in zip(H_CAN_IDS, stand_target)
+            if joint_suffix(mid) in ("HFE", "KFE", "FFE")))
+        if lean_sweep_rad:
+            print(f"LEAN SWEEP planned: after the stand hold, both FFE toe-down by up to "
+                  f"{a.lean_sweep_deg:g}deg at {LEAN_SWEEP_DPS:g}deg/s "
+                  f"({a.lean_sweep_deg / LEAN_SWEEP_DPS:.0f}s), then {LEAN_SWEEP_HOLD_S:g}s hold.")
     if a.sign_pose:
         print(f"SIGN POSE: sim default pose + {SIGN_POSE_EXTRA_DEG:g}deg outward on HR and HAA, "
               "both legs. Watch both legs; they must be mirror images.")
@@ -1971,5 +2156,5 @@ def main():
         current_limits=limits,
         policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)),
         stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target,
-        haa_close_rad=haa_close_rad)
+        haa_close_rad=haa_close_rad, lean_sweep_rad=lean_sweep_rad)
 if __name__=='__main__': sys.exit(main() or 0)

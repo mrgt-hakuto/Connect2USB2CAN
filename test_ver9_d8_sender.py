@@ -1515,3 +1515,110 @@ class FloorStandTests(unittest.TestCase):
         line = sender.stand_progress_line(4.0, 30.0, rows)
         self.assertIn("KFE 0.50/2.50A", line)
         self.assertIn("4/30s", line)
+
+
+class LeanSweepTests(unittest.TestCase):
+    """D10-11 (2026-09-23): stand-pose knobs and the floor lean sweep."""
+
+    _BASE = ["ver9_d8_sender.py", "--arm", "--all-axes", "--floor-limits",
+             "--stand-seconds", "30", "--stand-only", "--package", "x",
+             "--ramp-seconds", "10", "--csv", "x.csv"]
+
+    def _deg(self, target):
+        return {sender.H_BINDING_BY_ID[m].name: round(float(np.rad2deg(t)), 1)
+                for m, t in zip(sender.H_CAN_IDS, target)}
+
+    def test_stand_pose_knobs(self):
+        self.assertEqual(sender.stand_pose_target(), sender.STAND_TARGET)
+        self.assertEqual(self._deg(sender.stand_pose_target(20.0)), self._deg(sender.STAND_TARGET))
+        d = self._deg(sender.stand_pose_target(10.0, 4.0))
+        self.assertEqual((d["LL_HFE"], d["LR_KFE"], d["LL_FFE"], d["LR_FFE"], d["LL_HAA"]),
+                         (-5.0, 10.0, -1.0, -1.0, 0.0))
+        d0 = self._deg(sender.stand_pose_target(0.0))
+        self.assertTrue(all(v == 0.0 for v in d0.values()))
+
+    def test_lean_targets_move_only_ffe_toe_down(self):
+        t = sender.lean_sweep_targets(sender.STAND_TARGET, np.deg2rad(8), 4.0)
+        end = sender.lean_sweep_targets(sender.STAND_TARGET, np.deg2rad(8), 100.0)
+        for i, (a, b, s) in enumerate(zip(t, end, sender.STAND_TARGET)):
+            if i in sender.ffe_indices():
+                self.assertAlmostEqual(np.rad2deg(a - s), 4.0 * sender.LEAN_SWEEP_DPS)
+                self.assertAlmostEqual(np.rad2deg(b - s), 8.0)
+            else:
+                self.assertEqual((a, b), (s, s))
+
+    def test_balance_crossing(self):
+        self.assertAlmostEqual(sender.lean_balance_deg([0, 1, 2, 3], [4, 2, -2, -4]), 1.5)
+        self.assertIsNone(sender.lean_balance_deg([0, 1, 2], [5, 4, 3]))
+
+    def test_flags_reach_run(self):
+        argv = self._BASE + ["--stand-knee-deg", "10", "--lean-sweep-deg", "8"]
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", out):
+            sender.main()
+        kw = run.call_args.kwargs
+        self.assertAlmostEqual(kw["lean_sweep_rad"], np.deg2rad(8))
+        self.assertEqual(kw["stand_target"], sender.stand_pose_target(10.0))
+        self.assertIn("LEAN SWEEP planned", out.getvalue())
+
+    def test_policy_run_with_lean(self):
+        argv = [a for a in self._BASE if a != "--stand-only"]
+        argv = argv[:5] + ["20"] + argv[6:] + ["--stand-knee-deg", "10", "--stand-lean-deg", "3",
+                                              "--policy-slew-dps", "60", "--duration", "5"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", io.StringIO()):
+            sender.main()
+        self.assertEqual(run.call_args.kwargs["stand_target"], sender.stand_pose_target(10.0, 3.0))
+        self.assertIsNone(run.call_args.kwargs["lean_sweep_rad"])
+
+    def test_scope_and_ranges(self):
+        no_floor = [a if a != "--floor-limits" else "--gravity-limits" for a in self._BASE]
+        no_floor = no_floor[:5] + ["5"] + no_floor[6:]
+        bad = [
+            no_floor + ["--lean-sweep-deg", "8"],
+            self._BASE + ["--lean-sweep-deg", "11"],
+            self._BASE + ["--stand-knee-deg", "31"],
+            self._BASE + ["--stand-lean-deg", "9"],
+            self._BASE + ["--stand-lean-deg", "-6"],
+            [a if a != "--floor-limits" else "--gravity-limits" for a in self._BASE][:5] + ["2"]
+            + self._BASE[6:] + ["--haa-close-deg", "10", "--stand-knee-deg", "10"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_run_and_analyze_report_a_balance(self):
+        import contextlib
+        import csv as _csv
+        first = SimpleNamespace(joint_target_h_order=(0.0,) * 10, action_raw=np.zeros(10))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lean.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", AllAxesSlewTests._fake_bus(None, [])), \
+                    patch.object(sender, "RealT265", AllAxesSlewTests._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 side_effect=lambda *a, **k: (None, None, first, None)), \
+                    patch.object(sender, "LEAN_SWEEP_DPS", 40.0), \
+                    patch.object(sender, "LEAN_SWEEP_HOLD_S", 0.1), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.0, path, 0.0, 0.0, 0.0, transmit=True,
+                           ramp_seconds=0.05, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.floor_current_limits(), stand_seconds=0.1,
+                           stand_only=True, stand_target=sender.stand_pose_target(20.0, -5.0),
+                           lean_sweep_rad=np.deg2rad(10.0))
+                with path.open(encoding="utf-8") as handle:
+                    stages = {r["stage"] for r in _csv.DictReader(handle)}
+                analyzed = io.StringIO()
+                with contextlib.redirect_stdout(analyzed):
+                    sender.analyze_csv(path)
+        # The fake bus reports every axis at 0: FFE starts at -15 target (err -15), then the
+        # lean brings the target to -5 (err -5): the mean error never crosses from + to -.
+        self.assertIn("lean-sweep", stages)
+        self.assertIn("LEAN SWEEP (D10-11)", buffer.getvalue())
+        self.assertIn("BALANCE LEAN", analyzed.getvalue())
+        self.assertIn("custom stand pose", analyzed.getvalue())
