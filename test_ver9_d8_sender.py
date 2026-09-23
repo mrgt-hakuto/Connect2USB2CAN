@@ -1453,3 +1453,65 @@ class HaaSweepTests(unittest.TestCase):
                 self.assertAlmostEqual(target, sender.STAND_TARGET[index])
         self.assertIn("HAA SWEEP (D10-9)", analyzed.getvalue())
         self.assertIn("BLOCKED", analyzed.getvalue())
+
+
+class FloorStandTests(unittest.TestCase):
+    """D10-10 (2026-09-23): first loaded stand, hoist rope attached."""
+
+    _BASE = ["ver9_d8_sender.py", "--arm", "--all-axes", "--floor-limits",
+             "--stand-seconds", "30", "--stand-only", "--package", "x",
+             "--ramp-seconds", "10", "--csv", "x.csv"]
+
+    def test_floor_table_raises_only_kfe_and_ffe(self):
+        floor = sender.floor_current_limits()
+        gravity = sender.gravity_current_limits()
+        for mid in sender.H_CAN_IDS:
+            suffix = sender.joint_suffix(mid)
+            if suffix in ("KFE", "FFE"):
+                self.assertEqual(floor[mid], 6.0)
+                self.assertGreater(floor[mid], gravity[mid])
+            else:
+                self.assertEqual(floor[mid], gravity[mid])
+
+    def test_floor_limits_reach_run_with_a_long_hold(self):
+        out = io.StringIO()
+        with patch.object(sys, "argv", self._BASE), patch.object(sender, "run") as run, \
+                patch("sys.stdout", out):
+            sender.main()
+        self.assertEqual(run.call_args.kwargs["current_limits"], sender.floor_current_limits())
+        self.assertEqual(run.call_args.kwargs["stand_seconds"], 30.0)
+        self.assertIn("FLOOR LIMITS", out.getvalue())
+
+    def test_floor_policy_run_is_allowed(self):
+        argv = [a for a in self._BASE if a != "--stand-only"] + [
+            "--policy-slew-dps", "30", "--duration", "5"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", io.StringIO()):
+            sender.main()
+        self.assertFalse(run.call_args.kwargs["stand_only"])
+        self.assertEqual(run.call_args.kwargs["current_limits"], sender.floor_current_limits())
+
+    def test_long_hold_needs_floor_limits_and_scope_is_enforced(self):
+        long_hold = [a if a != "--floor-limits" else "--gravity-limits" for a in self._BASE]
+        bad = [
+            long_hold,
+            self._BASE + ["--gravity-limits"],
+            [a for a in self._BASE if a != "--all-axes"],
+            self._BASE[:4] + ["--stand-seconds", "31"] + self._BASE[6:],
+            self._BASE + ["--haa-close-deg", "10"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_progress_line_reports_each_pair(self):
+        rows = []
+        for mid in sender.H_CAN_IDS:
+            rows.append((0.0, "stand-hold", f"0x{mid:02X}", 0, 0, 0, 0, 0,
+                         2.5 if sender.H_BINDING_BY_ID[mid].name == "LR_KFE" else 0.5))
+        line = sender.stand_progress_line(4.0, 30.0, rows)
+        self.assertIn("KFE 0.50/2.50A", line)
+        self.assertIn("4/30s", line)

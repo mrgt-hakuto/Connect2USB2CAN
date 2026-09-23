@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_9_HAASWEEP_20260923_1500"
+BUILD_ID = "D10_10_FLOORSTAND_20260923_1600"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -75,6 +75,33 @@ ALL_AXES_MAX_DELTA_DEG = 30.0
 # it asked for KFE up to +178 deg.  --stand-seconds ramps to the sim default
 # pose instead, holds it, and only then hands over to the slew-limited policy.
 STAND_MAX_SECONDS = 5.0
+# D10-10 (2026-09-23): the first run with the feet on the floor.  The robot
+# stays on its hoist rope; the ramp to the stand pose is done in the air and
+# the operator lowers the hoist during the stand hold until the feet carry the
+# weight.  That needs a longer hold than STAND_MAX_SECONDS, so --floor-limits
+# (and only it) allows up to FLOOR_STAND_MAX_SECONDS.
+FLOOR_STAND_MAX_SECONDS = 30.0
+# Standing on the floor loads KFE and FFE far above anything the hanging runs
+# saw.  From robot_sim.urdf (10.1 kg), double support, feet under the ankles
+# with the centre of pressure 0 or +5 cm forward, at the sim default pose and
+# at the golden mean walking pose, the static need is
+#   HR <=0.1 A, HAA <=3.5 A, HFE <=9.1 A, KFE <=3.9 A, FFE <=4.7 A
+# (AK10-9 c_p 1.258, AK80-9 c_p 0.523).  --gravity-limits caps KFE at 3.0 A
+# and FFE at 2.0 A, below that.  This table raises ONLY those two, to about
+# 1.5x the estimate; everything else is the --gravity-limits table.  It is a
+# starting point for the FIRST loaded stand: the D10-10 R1 hold currents are
+# the measured values the next table must come from.  Still far under the
+# trained policy's effort (AK10-9 42.1 A, AK80-9 25.8 A).
+FLOOR_CURRENT_ABORT_A_BY_JOINT = {
+    "HR":   3.0,
+    "HAA":  6.0,
+    "HFE": 11.0,
+    "KFE":  6.0,   # static stance estimate <= 3.9 A
+    "FFE":  6.0,   # static stance estimate <= 4.7 A (CoP 5 cm ahead of the ankle)
+}
+# Printed every this many seconds during a long (floor) stand hold, so the
+# operator lowering the hoist can see the load arrive on the legs.
+STAND_PROGRESS_S = 2.0
 STAND_TARGET = tuple(float(value) for value in DEFAULT_JOINT_POS)
 # D10-7 (2026-09-23): after the D10-6 joint-sign fix, the stand pose alone
 # cannot show a wrong HR/HAA sign -- both sit at 0 there.  The sign pose adds
@@ -330,6 +357,26 @@ def gravity_current_limits():
     """Per-axis limits that clear this robot's own static gravity load."""
     return {mid: GRAVITY_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)]
             for mid in H_CAN_IDS}
+
+
+def floor_current_limits():
+    """D10-10: --gravity-limits with KFE and FFE raised for a loaded stand."""
+    return {mid: FLOOR_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)]
+            for mid in H_CAN_IDS}
+
+
+def stand_progress_line(elapsed_s, total_s, rows):
+    """Largest |current| per joint pair over the last progress window."""
+    parts = []
+    for suffix in ("HAA", "HFE", "KFE", "FFE"):
+        values = []
+        for side in ("LL", "LR"):
+            mid = next(m for m in H_CAN_IDS if H_BINDING_BY_ID[m].name == f"{side}_{suffix}")
+            label = f"0x{mid:02X}"
+            recent = [abs(row[8]) for row in rows if row[2] == label]
+            values.append(max(recent) if recent else 0.0)
+        parts.append(f"{suffix} {values[0]:.2f}/{values[1]:.2f}A")
+    return f"STAND HOLD {elapsed_s:4.0f}/{total_s:g}s: max|I| L/R " + ", ".join(parts)
 
 
 def all_axes_prearm_violations(initial_targets, initial_positions):
@@ -1414,16 +1461,26 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         if stand_seconds:
             print(f"STAND HOLD: holding the sim default pose for {stand_seconds:g}s. "
                   "Hands off the legs now.")
-            stand_end = time.monotonic() + stand_seconds
-            stand_next = time.monotonic()
+            stand_start = time.monotonic()
+            stand_end = stand_start + stand_seconds
+            stand_next = stand_start
+            window = []
+            next_progress = stand_start + STAND_PROGRESS_S
             while time.monotonic() < stand_end:
                 time.sleep(max(0, stand_next - time.monotonic()))
                 tick = time.monotonic()
                 bus.feedback()
                 for fr in frames(stand_target, motor_ids):
                     bus.send(fr)
-                rows.extend(axis_rows(tick, "stand-hold", stand_target, stand_target,
-                                      bus, motor_ids))
+                new_rows = axis_rows(tick, "stand-hold", stand_target, stand_target,
+                                     bus, motor_ids)
+                rows.extend(new_rows)
+                if stand_seconds > STAND_MAX_SECONDS:
+                    window.extend(new_rows)
+                    if tick >= next_progress:
+                        print(stand_progress_line(tick - stand_start, stand_seconds, window))
+                        window = []
+                        next_progress += STAND_PROGRESS_S
                 stand_next += PERIOD
             print(f"STAND HOLD complete: CAN tx={bus.tx_count}.")
             print_look_check(stand_target)
@@ -1746,6 +1803,7 @@ def main():
     p.add_argument('--all-axes', action='store_true', help='with --arm: drive all ten registered axes instead of one. Suspended robot only; every existing abort stays active')
     p.add_argument('--hold-pose', action='store_true', help='with --arm --all-axes: freeze every target at the position that axis is already in and measure the current it needs to hold itself. No policy, no T265, no --package')
     p.add_argument('--gravity-limits', action='store_true', help=f'per-axis current abort sized to this robot static gravity load instead of the flat {CURRENT_ABORT_A:.1f}A one-axis limit. Requires --all-axes. Needs explicit user approval: it RAISES the abort on load-bearing axes')
+    p.add_argument('--floor-limits', action='store_true', help=f'D10-10, feet on the floor with the hoist rope still attached: the --gravity-limits table with KFE and FFE raised to {FLOOR_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} / {FLOOR_CURRENT_ABORT_A_BY_JOINT["FFE"]:g} A, and --stand-seconds allowed up to {FLOOR_STAND_MAX_SECONDS:g} s so the hoist can be lowered during the hold. Requires --all-axes and --stand-seconds; not with --gravity-limits. Needs explicit user approval')
     p.add_argument('--policy-slew-dps', type=float, help=f'with --arm --all-axes (required there): rate-limit EVERY axis target in the policy stage to this many deg/s, 0 < value <= {POLICY_SLEW_MAX_DPS:g}. Removes the ramp->policy step that tripped D10-3 R3/R4')
     p.add_argument('--stand-seconds', type=float, help=f'with --arm --all-axes: ramp to the sim default pose (HAA 0, HFE -10, KFE +20, FFE -10 deg) over --ramp-seconds, hold it this long (0 < value <= {STAND_MAX_SECONDS:g}), then start the slew-limited policy from there')
     p.add_argument('--sign-pose', action='store_true', help=f'with --stand-only (D10-7): hold the sim default pose plus {SIGN_POSE_EXTRA_DEG:g} deg outward on HR and HAA of both legs, so every joint sign can be checked by eye')
@@ -1765,7 +1823,23 @@ def main():
     if a.gravity_limits and a.static_probe:
         p.error('--gravity-limits must not be combined with --static-probe; a one-axis '
                 'probe carries no load and its limit is not the thing under test')
-    limits = gravity_current_limits() if a.gravity_limits else default_current_limits()
+    if a.floor_limits:
+        if a.gravity_limits:
+            p.error('--floor-limits already contains the --gravity-limits table; pass one of them')
+        if not a.all_axes or a.hold_pose or a.static_probe or a.stand_seconds is None:
+            p.error('--floor-limits is for a whole-body stand on the floor: --all-axes and '
+                    '--stand-seconds, without --hold-pose or --static-probe')
+        if a.haa_close_deg is not None or a.sign_pose:
+            p.error('--floor-limits is not for the hanging checks (--haa-close-deg, --sign-pose)')
+    limits = (floor_current_limits() if a.floor_limits
+              else gravity_current_limits() if a.gravity_limits else default_current_limits())
+    if a.floor_limits:
+        print("FLOOR LIMITS: per-axis current abort " + ", ".join(
+            f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS))
+        print(f"FLOOR LIMITS: --gravity-limits with KFE/FFE raised for a loaded stand "
+              f"(URDF static stance estimate KFE <=3.9A, FFE <=4.7A). Speed abort "
+              f"{np.rad2deg(SPEED_ABORT_RAD_S):.0f}deg/s, stale feedback, motor error and origin "
+              "aborts are unchanged. Keep the hoist rope attached.")
     if a.gravity_limits:
         print("GRAVITY LIMITS: per-axis current abort raised to " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A"
@@ -1787,8 +1861,11 @@ def main():
         if not a.all_axes or a.hold_pose or a.static_probe:
             p.error('--stand-seconds/--stand-only are for a whole-body run: --all-axes, '
                     'without --hold-pose or --static-probe')
-        if a.stand_seconds is None or not 0 < a.stand_seconds <= STAND_MAX_SECONDS:
-            p.error(f'--stand-seconds must satisfy 0 < value <= {STAND_MAX_SECONDS:g}')
+        stand_max = FLOOR_STAND_MAX_SECONDS if a.floor_limits else STAND_MAX_SECONDS
+        if a.stand_seconds is None or not 0 < a.stand_seconds <= stand_max:
+            p.error(f'--stand-seconds must satisfy 0 < value <= {stand_max:g}'
+                    + ('' if a.floor_limits else
+                       f' (up to {FLOOR_STAND_MAX_SECONDS:g} only with --floor-limits)'))
         if a.stand_only and (a.duration or a.policy_slew_dps is not None
                              or a.vx or a.vy or a.wz):
             p.error('--stand-only runs no policy: leave --duration, --policy-slew-dps '
