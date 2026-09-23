@@ -2040,3 +2040,60 @@ class StartGateTests(unittest.TestCase):
         self.assertIn("BACK", text)
         self.assertFalse([r for r in rows if r["stage"] == "policy"])
         self.assertIn("START GATE timeout", abort)
+
+
+class ZeroOffsetTests(unittest.TestCase):
+    """D10-13D (2026-09-23): D7 origin (straight legs) -> sim joint zero (CAD pose)."""
+
+    def setUp(self):
+        self.addCleanup(sender.set_zero_offset, None)
+
+    def test_default_is_zero(self):
+        sender.set_zero_offset(None)
+        self.assertTrue(np.all(sender.ZERO_OFFSET_RAD == 0.0))
+
+    def test_targets_and_feedback_cross_the_offset(self):
+        sender.set_zero_offset("cad_fk")
+        kfe = sender.H_CAN_IDS[sender.OBS_JOINT_NAMES.index("LL_KFE")] if hasattr(sender, "OBS_JOINT_NAMES") else 0x1A
+        self.assertEqual(kfe, 0x1A)
+        _kp, _kd, wire, _v, _t = sender.wire_command(0x1A, np.deg2rad(20.0))
+        # LL_KFE sign +1: sim 20 deg = 32.3 deg from the straight D7 origin.
+        self.assertAlmostEqual(np.rad2deg(wire), 32.3, delta=0.1)
+        state = SimpleNamespace(pos=32.3, spd=0.0, cur=0.0)
+        position, _v, _c = sender.h_feedback(0x1A, state)
+        self.assertAlmostEqual(np.rad2deg(position), 20.0, places=3)
+        frame_targets = list(sender.STAND_TARGET)
+        frames = sender.frames(frame_targets, (0x1A,))
+        self.assertEqual(len(frames), 1)
+
+    def test_right_leg_sign_is_respected(self):
+        sender.set_zero_offset("cad_fk")
+        # LR_KFE (0x12) has joint sign -1: sim 20 deg = 27.2 deg straight-origin = motor -27.2.
+        _kp, _kd, wire, _v, _t = sender.wire_command(0x12, np.deg2rad(20.0))
+        self.assertAlmostEqual(np.rad2deg(wire), -27.2, delta=0.1)
+        position, _v, _c = sender.h_feedback(0x12, SimpleNamespace(pos=-27.2, spd=0.0, cur=0.0))
+        self.assertAlmostEqual(np.rad2deg(position), 20.0, places=3)
+
+    def test_flag(self):
+        argv = FloorWalkTests._WALK + ["--duration", "5", "--zero-offset", "cad_fk"]
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "z.csv") for a in argv]
+            with patch.object(sys, "argv", argv), patch.object(sender, "run"), patch("sys.stdout", out):
+                sender.main()
+            meta = (Path(directory) / "z_meta.txt").read_text(encoding="utf-8")
+        self.assertIn("ZERO OFFSET cad_fk", out.getvalue())
+        self.assertIn("LL_KFE=-12.3", meta)
+        bad = [a for a in argv if a != "--all-axes"]
+        with patch.object(sys, "argv", bad), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+
+    def test_stand_ramp_allows_45_deg_but_policy_gate_keeps_30(self):
+        target = list(sender.STAND_TARGET)
+        start = list(target)
+        start[sender.H_CAN_IDS.index(0x1A)] = target[sender.H_CAN_IDS.index(0x1A)] - np.deg2rad(40)
+        self.assertTrue(sender.all_axes_prearm_violations(target, start))
+        self.assertFalse(sender.all_axes_prearm_violations(target, start, sender.STAND_RAMP_MAX_DELTA_DEG))

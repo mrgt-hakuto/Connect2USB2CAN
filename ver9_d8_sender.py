@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13C_STARTGATE_20260923_2130"
+BUILD_ID = "D10_13D_ZEROOFFSET_20260923_2300"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -184,6 +184,25 @@ START_GATE_PRINT_S = 0.5
 # --fine-timer switches the loop clock to perf_counter and asks Windows for a
 # 1 ms timer for the duration of the run.
 TIMING_LATE_S = 0.025
+# D10-13D (2026-09-23): the sim's joint zero is the CAD assembly pose at URDF
+# export, and forward kinematics of onshape_export/myrobot_dummy/robot_sim.urdf
+# says that pose is NOT a straight leg: thigh +2.9 / -0.9 deg forward, knee
+# bent 12.3 (left) / 7.2 (right) deg, shank 9.4 / 8.1 deg back.  The D7
+# origin is set with the legs held straight by eye.  If both are true, the
+# robot's H angle and the sim's joint angle differ by a constant per joint:
+#     sim_angle = H_angle_from_the_D7_origin + offset
+# (assumes the D7 pose is pivots collinear and sole parallel to the body,
+# and the CAD pose also has the sole parallel to the body).  With the offset
+# the hold pose is the sim default for real (CoM 1.5-2.3 cm in front of the
+# ankles in the URDF) instead of CoM 0.1-0.2 cm in front.  Opt-in only.
+ZERO_OFFSET_PRESETS_DEG = {
+    "cad_fk": {"LL_HFE": 2.9, "LR_HFE": -0.9, "LL_KFE": -12.3, "LR_KFE": -7.2,
+               "LL_FFE": 9.4, "LR_FFE": 8.1},
+}
+ZERO_OFFSET_RAD = np.zeros(10)   # H order; sim_angle = D7-origin angle + this
+# D10-13D: a whole-body run that ramps to the fixed stand pose over >= 10 s may
+# start up to this far from it (the policy-target gate stays at 30 deg).
+STAND_RAMP_MAX_DELTA_DEG = 45.0
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -425,7 +444,7 @@ def h_feedback(motor_id, state):
     The current keeps its magnitude; only its sign follows the joint.
     """
     position, velocity = servo_feedback_to_h_units(state.pos, state.spd, motor_id)
-    return position, velocity, motor_to_h(motor_id, state.cur)
+    return position + zero_offset_rad(motor_id), velocity, motor_to_h(motor_id, state.cur)
 
 
 def joint_suffix(motor_id):
@@ -610,13 +629,30 @@ def stand_progress_line(elapsed_s, total_s, rows):
     return f"STAND HOLD {elapsed_s:4.0f}/{total_s:g}s: max|I| L/R " + ", ".join(parts)
 
 
-def all_axes_prearm_violations(initial_targets, initial_positions):
+def set_zero_offset(preset):
+    """Activate one ZERO_OFFSET_PRESETS_DEG entry (None = all zero).  Returns the table."""
+    global ZERO_OFFSET_RAD
+    table = ZERO_OFFSET_PRESETS_DEG[preset] if preset else {}
+    names = [H_BINDING_BY_ID[mid].name for mid in H_CAN_IDS]
+    unknown = set(table) - set(names)
+    if unknown:
+        raise ValueError(f"unknown joints in zero offset: {sorted(unknown)}")
+    ZERO_OFFSET_RAD = np.array([np.deg2rad(table.get(name, 0.0)) for name in names])
+    return table
+
+
+def zero_offset_rad(motor_id):
+    return float(ZERO_OFFSET_RAD[H_CAN_IDS.index(motor_id)])
+
+
+def all_axes_prearm_violations(initial_targets, initial_positions, max_delta_deg=None):
     """Axes whose frozen first policy target a whole-body ramp must not chase."""
+    max_delta_deg = ALL_AXES_MAX_DELTA_DEG if max_delta_deg is None else max_delta_deg
     out = []
     for mid, target, position in zip(H_CAN_IDS, initial_targets, initial_positions):
         target_deg = float(np.rad2deg(target))
         delta_deg = float(np.rad2deg(target - position))
-        if abs(target_deg) > ALL_AXES_MAX_TARGET_DEG or abs(delta_deg) > ALL_AXES_MAX_DELTA_DEG:
+        if abs(target_deg) > ALL_AXES_MAX_TARGET_DEG or abs(delta_deg) > max_delta_deg:
             out.append(f"0x{mid:02X} {H_BINDING_BY_ID[mid].name} "
                        f"target={target_deg:+.1f}deg delta={delta_deg:+.1f}deg")
     return out
@@ -692,7 +728,7 @@ def frames(targets, motor_ids=H_CAN_IDS):
         raise ValueError("motor_ids must be registered H CAN IDs")
     return tuple(
         f_mit(motor_id, *gains()[index_by_id[motor_id]],
-              h_to_motor(motor_id, targets[index_by_id[motor_id]]), 0., 0.,
+              h_to_motor(motor_id, targets[index_by_id[motor_id]] - zero_offset_rad(motor_id)), 0., 0.,
               H_MODELS[index_by_id[motor_id]])
         for motor_id in motor_ids
     )
@@ -710,7 +746,8 @@ def wire_command(motor_id, target_rad):
     """
     index = H_CAN_IDS.index(motor_id)
     kp, kd = gains()[index]
-    return quantized_cmd((kp, kd, h_to_motor(motor_id, target_rad), 0.0, 0.0), H_MODELS[index])
+    return quantized_cmd((kp, kd, h_to_motor(motor_id, target_rad - zero_offset_rad(motor_id)), 0.0, 0.0),
+                         H_MODELS[index])
 
 
 def ramp_targets(start, target, elapsed_s, ramp_seconds):
@@ -1178,7 +1215,10 @@ class DualBus:
             if s.err: raise RuntimeError(f"motor error 0x{mid:02X} ch={channel}: {s.err}")
             p,v=servo_feedback_to_h_units(s.pos,s.spd,mid)
             if abs(p) > ORIGIN_ABORT_RAD:
-                raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg; D7 o 0 is required")
+                raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {np.rad2deg(p):+.1f}deg "
+                                   f"from the D7 origin (limit {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg). "
+                                   "If the leg really is there, no new D7 is needed; if it is not, redo D7 o 0")
+            p = p + zero_offset_rad(mid)
             limit = self.current_limit_a.get(mid, CURRENT_ABORT_A)
             speed_limit = getattr(self, "speed_abort_rad_s", SPEED_ABORT_RAD_S)
             if abs(s.cur)>limit or abs(v)>speed_limit:
@@ -1607,14 +1647,15 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 f"delta={np.rad2deg(target-position):+.1f}deg"
                 for mid, target, position in zip(H_CAN_IDS, stand_target, initial_positions)
             ))
-        violations = all_axes_prearm_violations(ramp_goal, initial_positions)
+        delta_limit = STAND_RAMP_MAX_DELTA_DEG if stand_seconds else ALL_AXES_MAX_DELTA_DEG
+        violations = all_axes_prearm_violations(ramp_goal, initial_positions, delta_limit)
         if violations:
             print(f"ALL-AXES PRE-ARM GATE: would REFUSE a whole-body run "
                   f"(|target|>{ALL_AXES_MAX_TARGET_DEG:g}deg or |delta|>"
-                  f"{ALL_AXES_MAX_DELTA_DEG:g}deg): " + "; ".join(violations))
+                  f"{delta_limit:g}deg): " + "; ".join(violations))
         else:
             print(f"ALL-AXES PRE-ARM GATE: ok (every |target|<={ALL_AXES_MAX_TARGET_DEG:g}deg "
-                  f"and |delta|<={ALL_AXES_MAX_DELTA_DEG:g}deg).")
+                  f"and |delta|<={delta_limit:g}deg).")
         if not transmit:
             print("PREFLIGHT complete: CAN transmit count is zero.")
             return
@@ -1625,7 +1666,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             if violations:
                 raise RuntimeError("ALL-AXES PRE-ARM GATE refused before any MIT frame: "
                                    + "; ".join(violations)
-                                   + ". Re-seat the legs straight down, D7 `oa`, and preflight again.")
+                                   + ". Hold the legs near the stand pose (straight down) and start again; "
+                                   "no new D7 `oa` is needed unless scan shows the origin moved.")
 
         if ramp_seconds is None:
             raise RuntimeError("--arm requires an explicit --ramp-seconds value")
@@ -2065,8 +2107,8 @@ def unique_csv_path(path):
     """Never overwrite an earlier run: return path, or path_2, path_3, ... (D10-13C)."""
     path = Path(path)
     def taken(candidate):
-        return any(x.exists() for x in (candidate, obs_csv_path(candidate),
-                                         abort_txt_path(candidate), timing_csv_path(candidate)))
+        return any(x.exists() for x in (candidate, obs_csv_path(candidate), abort_txt_path(candidate),
+                                         timing_csv_path(candidate), meta_txt_path(candidate)))
     if not taken(path):
         return path
     for number in range(2, 1000):
@@ -2074,6 +2116,12 @@ def unique_csv_path(path):
         if not taken(candidate):
             return candidate
     raise RuntimeError(f"no free CSV name next to {path}")
+
+
+def meta_txt_path(csv_path):
+    """Build, command line and zero offset of one run (D10-13D)."""
+    csv_path = Path(csv_path)
+    return csv_path.with_name(csv_path.stem + "_meta.txt")
 
 
 def abort_txt_path(csv_path):
@@ -2226,6 +2274,9 @@ def analyze_csv(csv_path):
     kp_cmd = wire_command(motor_id, rows[0][5])[0]
     initial_position = rows[0][6]
     initial_target = rows[0][3]
+    meta_path = meta_txt_path(csv_path)
+    if meta_path.exists():
+        print("RUN META: " + " | ".join(meta_path.read_text(encoding="utf-8").strip().splitlines()))
     timing_path = timing_csv_path(csv_path)
     if timing_path.exists():
         report_timing_csv(timing_path)
@@ -2349,6 +2400,7 @@ def main():
     p.add_argument('--walk-speed-abort-dps', type=float, help=f'D10-13B, with --walk-limits: speed abort in deg/s ({np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}; default {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}). Needs explicit user approval')
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
+    p.add_argument('--zero-offset', choices=sorted(ZERO_OFFSET_PRESETS_DEG), help='D10-13D, with --all-axes: map the D7 origin (legs straight by eye) to the sim joint zero (CAD pose) with a fixed per-joint offset; see ZERO_OFFSET_PRESETS_DEG')
     p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
@@ -2556,11 +2608,27 @@ def main():
                   "probe, and do not raise Kp, the target angle or the current abort.")
         return D9_3_EXIT_CODE[letter]
     if not a.package: p.error('--package is required')
+    if a.zero_offset:
+        if not a.all_axes:
+            p.error('--zero-offset is for a whole-body run: pass --all-axes')
+        table = set_zero_offset(a.zero_offset)
+        print(f"ZERO OFFSET {a.zero_offset}: sim angle = D7-origin angle + offset: "
+              + ", ".join(f"{name}={value:+.1f}deg" for name, value in table.items()))
     if a.csv and (a.arm or a.preflight) and not a.analyze:
         fresh = unique_csv_path(a.csv)
         if fresh != Path(a.csv):
             print(f"CSV NAME: {a.csv} is already used; this run writes {fresh} instead.")
         a.csv = fresh
+        try:
+            meta = meta_txt_path(a.csv)
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} build={BUILD_ID}\n"
+                            f"argv={' '.join(sys.argv[1:])}\n"
+                            f"zero_offset={a.zero_offset or 'none'} "
+                            + " ".join(f"{H_BINDING_BY_ID[mid].name}={np.rad2deg(zero_offset_rad(mid)):+.1f}"
+                                       for mid in H_CAN_IDS) + "\n", encoding="utf-8")
+        except Exception as error:
+            print(f"WARNING: meta record failed: {error}")
     if a.preflight:
         # A path is still supplied so evidence is written consistently, but
         # no policy frame or cleanup frame is put on CAN.
