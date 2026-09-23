@@ -1320,3 +1320,26 @@ class SignPoseTests(unittest.TestCase):
         self.assertIn("LOOK CHECK", text)
         self.assertIn("toe turned OUTWARD", text)
         self.assertIn("droop=  +0.00deg", text)
+
+
+class ObservationSidecarTests(unittest.TestCase):
+    """D10-8: what the policy saw is saved next to the run CSV and summarised."""
+
+    def test_sidecar_round_trip_and_report(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as directory:
+            run_csv = Path(directory) / "r.csv"
+            sidecar = sender.obs_csv_path(run_csv)
+            self.assertEqual(sidecar.name, "r_obs.csv")
+            obs = [0.0] * 42
+            obs[8] = -1.0
+            rows = [(0.0, "initial", *obs, *([0.0] * 10))]
+            rows += [(0.02 * t, "policy", *obs, *([0.1] * 10)) for t in range(5)]
+            sender.write_obs_csv(sidecar, rows)
+            self.assertEqual(len(sender.obs_header()), 2 + 42 + 10)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                tilt = sender.report_observation(sidecar)
+        self.assertAlmostEqual(tilt, 0.0, places=3)
+        self.assertIn("5 policy tick(s)", buffer.getvalue())
+        self.assertIn("LL_KFE=+0.0", buffer.getvalue())

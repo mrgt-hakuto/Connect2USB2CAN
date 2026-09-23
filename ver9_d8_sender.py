@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_7_SIGNPOSE_20260923_1430"
+BUILD_ID = "D10_8_POSREL_20260923_1530"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -1121,6 +1121,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
+    # D10-8: every policy evaluation's full 42-dim observation and raw action,
+    # so what the policy SAW can be judged from the saved log.
+    obs_rows=[]
     try:
         bus.open(); bus_opened=True; t265_start_attempted=True; t265.start(); deadline=time.monotonic()+5
         while t265.latest() is None:
@@ -1131,9 +1134,18 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         # mode this is the complete hardware interaction: no MIT cleanup frame
         # is sent because DualBus.mit_frames_sent remains false.
         feedback = bus.feedback()
-        _s, _o, initial_out, _plan = evaluate_cycle(
+        _s, initial_obs, initial_out, _plan = evaluate_cycle(
             policy, t265.latest(), feedback, cmd.sample(time.monotonic()), last
         )
+        if initial_obs is not None:
+            obs_rows.append((time.monotonic(), "initial", *map(float, initial_obs),
+                             *map(float, initial_out.action_raw)))
+            g = np.asarray(initial_obs[6:9], dtype=float)
+            tilt = float(np.rad2deg(np.arccos(np.clip(-g[2] / max(np.linalg.norm(g), 1e-9), -1, 1))))
+            print(f"INITIAL OBS: gravity=({g[0]:+.3f},{g[1]:+.3f},{g[2]:+.3f}) tilt={tilt:.1f}deg; "
+                  "pos_rel(deg)=" + ", ".join(
+                      f"{name}={np.rad2deg(value):+.1f}"
+                      for name, value in zip(OBS_JOINT_NAMES, initial_obs[12:22])))
         initial_targets = initial_out.joint_target_h_order
         # MotorFeedback is the shell boundary object; its values are already
         # radians, under the public `position` / `velocity` names.
@@ -1276,6 +1288,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         while time.monotonic()<end:
             time.sleep(max(0,nxt-time.monotonic())); tick=time.monotonic()
             _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),cmd.sample(tick),last)
+            if _o is not None:
+                obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
             desired_target = out.joint_target_h_order[selected_index]
             if policy_slew_rad_s is not None:
                 commanded_all = slew_all(commanded_all, out.joint_target_h_order,
@@ -1356,6 +1370,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 print(f"WARNING: CAN cleanup failed: {error}")
         # Preserve evidence from a partial run without masking its primary error.
         try:
+            if obs_rows:
+                write_obs_csv(obs_csv_path(csv_path), obs_rows)
+        except Exception as error:
+            print(f"WARNING: observation CSV cleanup failed: {error}")
+        try:
             csv_path.parent.mkdir(parents=True,exist_ok=True)
             with csv_path.open('w',newline='',encoding='utf-8') as f:
                 w=csv.writer(f)
@@ -1367,6 +1386,78 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 w.writerows(rows)
         except Exception as error:
             print(f"WARNING: CSV cleanup failed: {error}")
+
+OBS_TERMS = (
+    ("lin_vel", 0, 3), ("ang_vel", 3, 6), ("gravity", 6, 9), ("command", 9, 12),
+    ("pos_rel", 12, 22), ("joint_vel", 22, 32), ("last_action", 32, 42),
+)
+OBS_JOINT_NAMES = ("LL_HR", "LR_HR", "LL_HAA", "LR_HAA", "LL_HFE", "LR_HFE",
+                   "LL_KFE", "LR_KFE", "LL_FFE", "LR_FFE")
+
+
+def obs_csv_path(csv_path):
+    """The observation sidecar that belongs to one run CSV."""
+    csv_path = Path(csv_path)
+    return csv_path.with_name(csv_path.stem + "_obs.csv")
+
+
+def obs_header():
+    names = []
+    for term, lo, hi in OBS_TERMS:
+        if term in ("pos_rel", "joint_vel", "last_action"):
+            names += [f"obs_{term}_{joint}" for joint in OBS_JOINT_NAMES]
+        else:
+            names += [f"obs_{term}_{axis}" for axis in "xyz"[: hi - lo]]
+    return ("tick", "stage", *names, *[f"action_raw_{joint}" for joint in OBS_JOINT_NAMES])
+
+
+def write_obs_csv(path, obs_rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(obs_header())
+        writer.writerows(obs_rows)
+
+
+def report_observation(path):
+    """What the policy saw, from the saved sidecar: body tilt, rotation, joints.
+
+    Hanging on a rope, the body should read level (gravity ~ (0,0,-1)), still
+    and with joint_pos_rel near zero at the stand pose.  Anything else is
+    something the policy reacts to that the eye does not see.
+    """
+    with path.open(newline="", encoding="utf-8") as file:
+        records = list(csv.DictReader(file))
+    policy = [r for r in records if r["stage"] == "policy"]
+    initial = [r for r in records if r["stage"] == "initial"]
+    print(f"OBSERVATION ({path.name}): {len(policy)} policy tick(s).")
+    if initial:
+        rel = [float(initial[0][f"obs_pos_rel_{joint}"]) for joint in OBS_JOINT_NAMES]
+        print("  initial pos_rel (deg): " + ", ".join(
+            f"{joint}={np.rad2deg(value):+.1f}" for joint, value in zip(OBS_JOINT_NAMES, rel)))
+    if not policy:
+        return None
+    def column(name):
+        return np.array([float(r[name]) for r in policy])
+    gravity = np.stack([column(f"obs_gravity_{axis}") for axis in "xyz"], axis=1)
+    mean_g = gravity.mean(axis=0)
+    tilt = np.rad2deg(np.arccos(np.clip(-mean_g[2] / max(np.linalg.norm(mean_g), 1e-9), -1, 1)))
+    roll = np.rad2deg(np.arctan2(mean_g[1], -mean_g[2]))
+    pitch = np.rad2deg(np.arctan2(-mean_g[0], -mean_g[2]))
+    print(f"  gravity mean=({mean_g[0]:+.3f},{mean_g[1]:+.3f},{mean_g[2]:+.3f}) "
+          f"tilt={tilt:.1f}deg (roll~{roll:+.1f}, pitch~{pitch:+.1f}; sim golden walks at ~2deg)")
+    for term in ("lin_vel", "ang_vel"):
+        values = np.stack([column(f"obs_{term}_{axis}") for axis in "xyz"], axis=1)
+        print(f"  {term} mean=({', '.join(f'{v:+.2f}' for v in values.mean(axis=0))}) "
+              f"max|.|=({', '.join(f'{v:.2f}' for v in np.abs(values).max(axis=0))})")
+    command = [column(f"obs_command_{axis}").mean() for axis in "xyz"]
+    print(f"  command mean=({command[0]:+.2f},{command[1]:+.2f},{command[2]:+.2f})")
+    print("  pos_rel mean (deg): " + ", ".join(
+        f"{joint}={np.rad2deg(column(f'obs_pos_rel_{joint}').mean()):+.1f}" for joint in OBS_JOINT_NAMES))
+    print("  action_raw mean: " + ", ".join(
+        f"{joint}={column(f'action_raw_{joint}').mean():+.2f}" for joint in OBS_JOINT_NAMES))
+    return tilt
+
 
 def analyze_csv(csv_path):
     """Re-judge a saved one-axis CSV.  Opens no bus and sends no CAN frame."""
@@ -1446,6 +1537,11 @@ def analyze_csv(csv_path):
                 report_hold_pose(stand, stand_target, logged_ids, default_current_limits())
             report_all_axes(rows, positions, targets, logged_ids)
             report_slew_gap(rows, logged_ids)
+        sidecar = obs_csv_path(csv_path)
+        if sidecar.exists():
+            report_observation(sidecar)
+        elif any(row[1] == "policy" for row in rows):
+            print("NOTE: no observation sidecar (runs before D10-8 did not save one).")
         return 0
     if rows[0][1].startswith("probe"):
         result = probe_result(rows, initial_position,

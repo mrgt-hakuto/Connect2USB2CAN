@@ -69,7 +69,11 @@ class IntegrationTests(unittest.TestCase):
             FakePolicy(), self.t265, self.motors, self.command, np.zeros(10),
         )
         np.testing.assert_array_equal(observation[:12], np.array([1, 2, 3, 4, 5, 6, 0, 0, -1, .1, -.2, .3], dtype=np.float32))
-        np.testing.assert_array_equal(observation[12:22], np.arange(10, dtype=np.float32))
+        # joint_pos_rel (D10-8): feedback minus the sim default pose.
+        np.testing.assert_allclose(
+            observation[12:22],
+            np.arange(10, dtype=np.float32) - np.asarray(integration.DEFAULT_JOINT_POS, dtype=np.float32),
+            rtol=0, atol=1e-6)
         np.testing.assert_array_equal(observation[22:32], np.arange(10, 20, dtype=np.float32))
         self.assertEqual(tuple(target.can_id for target in plan), integration.H_CAN_IDS)
         self.assertEqual(tuple(target.model for target in plan), integration.H_MODELS)
@@ -123,3 +127,33 @@ class IntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JointPosRelTests(unittest.TestCase):
+    """D10-8 (2026-09-23): the observation is joint_pos_rel, as in golden.npz."""
+
+    def test_default_pose_observes_as_zero(self):
+        now = 0.0
+        t265 = integration.T265Sample(now, (0, 0, 0), (0, 0, 0), (0, 0, -1), 3, offset_pending=False)
+        motors = {can_id: integration.MotorFeedback(can_id, now, float(integration.DEFAULT_JOINT_POS[i]), 0.0)
+                  for i, can_id in enumerate(integration.H_CAN_IDS)}
+        command = integration.VelocityCommand(now, 0.0, 0.0, 0.0, source="fixed", state="fixed")
+        _snapshot, observation, _output, _plan = integration.evaluate_cycle(
+            FakePolicy(), t265, motors, command, np.zeros(10))
+        np.testing.assert_allclose(observation[12:22], np.zeros(10), atol=1e-7)
+
+    def test_matches_golden_joint_terms(self):
+        package = Path(__file__).resolve().parent.parent / "wanpbl2026_slope_climing_robot" / "H_eff13p5_2999" / "H_eff13p5_2999"
+        if not (package / "golden.npz").exists():
+            self.skipTest("golden package not present")
+        golden = np.load(package / "golden.npz")
+        now = 0.0
+        t265 = integration.T265Sample(now, (0, 0, 0), (0, 0, 0), (0, 0, -1), 3, offset_pending=False)
+        command = integration.VelocityCommand(now, 0.0, 0.0, 0.0, source="fixed", state="fixed")
+        for step in (1, 100, 499):
+            positions = golden["joint_pos"][step - 1]  # obs[t] is built from joint_pos[t-1]
+            motors = {can_id: integration.MotorFeedback(can_id, now, float(positions[i]), 0.0)
+                      for i, can_id in enumerate(integration.H_CAN_IDS)}
+            _s, observation, _o, _p = integration.evaluate_cycle(
+                FakePolicy(), t265, motors, command, np.zeros(10))
+            np.testing.assert_allclose(observation[12:22], golden["obs_flat"][step][12:22], atol=1e-5)

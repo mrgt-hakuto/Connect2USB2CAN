@@ -22,6 +22,7 @@ import numpy as np
 
 from policy_integration import (
     ACTION_SIZE,
+    DEFAULT_JOINT_POS,
     BaseObservation,
     HPolicy,
     JointObservation,
@@ -86,8 +87,14 @@ def policy_snapshot_from_inputs(
         raise ValueError(f"missing D4/D7 motor feedback for {rendered}")
     return PolicySnapshot(
         base=BaseObservation(t265.linear_velocity, t265.angular_velocity, t265.projected_gravity),
+        # H observes joint_pos_rel = joint_pos - default_joint_pos
+        # (obs_contract.md, Isaac Lab mdp.joint_pos_rel).  D10-8, 2026-09-23:
+        # this subtraction was missing, so every real-robot run up to D10-7
+        # showed the policy HFE/FFE 10 deg and KFE 20 deg off.  golden.npz
+        # confirms it exactly: obs[t] == joint_pos[t-1] - default_joint_pos.
         joints=JointObservation(
-            np.array([feedback_by_can_id[can_id].position for can_id in H_CAN_IDS], dtype=np.float32),
+            np.array([feedback_by_can_id[can_id].position for can_id in H_CAN_IDS], dtype=np.float32)
+            - np.asarray(DEFAULT_JOINT_POS, dtype=np.float32),
             np.array([feedback_by_can_id[can_id].velocity for can_id in H_CAN_IDS], dtype=np.float32),
         ),
         velocity_command=np.array((command.vx, command.vy, command.wz), dtype=np.float32),
