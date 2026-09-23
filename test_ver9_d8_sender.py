@@ -1802,3 +1802,108 @@ class FloorWalkTests(unittest.TestCase):
         self.assertEqual(policy_calls[-1][0], 0.2)
         self.assertIn("COMMAND DELAY", buffer.getvalue())
         self.assertIn("COMMAND: vx=+0.20", buffer.getvalue())
+
+
+class SoftStopTests(unittest.TestCase):
+    """D10-13B (2026-09-23): raised walk speed abort and a soft stop after an abort."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "5"]
+
+    def _main(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", out):
+            sender.main()
+        return run.call_args.kwargs, out.getvalue()
+
+    def test_defaults_are_unchanged(self):
+        kw, text = self._main(self._WALK)
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(200.0))
+        self.assertIsNone(kw["soft_stop_s"])
+        self.assertNotIn("SOFT STOP armed", text)
+
+    def test_flags_reach_run(self):
+        kw, text = self._main(self._WALK + ["--walk-speed-abort-dps", "400", "--soft-stop-seconds", "3"])
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(400.0))
+        self.assertEqual(kw["soft_stop_s"], 3.0)
+        self.assertIn("speed abort 400deg/s", text)
+        self.assertIn("SOFT STOP armed", text)
+
+    def test_refusals(self):
+        floor = [a if a != "--walk-limits" else "--floor-limits" for a in self._WALK]
+        floor[floor.index("200")] = "60"
+        bad = [
+            self._WALK + ["--walk-speed-abort-dps", "401"],
+            self._WALK + ["--walk-speed-abort-dps", "199"],
+            self._WALK + ["--soft-stop-seconds", "0"],
+            self._WALK + ["--soft-stop-seconds", "5.1"],
+            floor + ["--walk-speed-abort-dps", "300"],
+            floor + ["--soft-stop-seconds", "3"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_which_aborts_get_a_soft_stop(self):
+        self.assertTrue(sender.is_soft_stop_abort(RuntimeError("motion/current abort 0x1A ch=0: x")))
+        self.assertTrue(sender.is_soft_stop_abort(RuntimeError("origin/pre-arm pose abort 0x2A ch=1: x")))
+        self.assertFalse(sender.is_soft_stop_abort(RuntimeError("stale feedback 0x1A ch=0")))
+        self.assertFalse(sender.is_soft_stop_abort(RuntimeError("motor error 0x1A ch=0: 3")))
+
+    def _abort_run(self, soft_stop_s, bus_cls=None):
+        import contextlib
+        import csv as _csv
+        calls = []
+        first = SimpleNamespace(joint_target_h_order=sender.STAND_TARGET, action_raw=np.zeros(10))
+
+        def fake_eval(*_a, **_k):
+            calls.append(1)
+            if len(calls) >= 3:
+                raise RuntimeError("motion/current abort 0x1A ch=0: cur=+0.1A, speed=+250.0deg/s")
+            return None, None, first, None
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "s.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", bus_cls or AllAxesSlewTests._fake_bus(None, [])), \
+                    patch.object(sender, "RealT265", AllAxesSlewTests._FakeT265), \
+                    patch.object(sender, "evaluate_cycle", side_effect=fake_eval), \
+                    contextlib.redirect_stdout(buffer):
+                with self.assertRaises(RuntimeError):
+                    sender.run(Path(directory), 1.0, path, 0.0, 0.0, 0.0,
+                               transmit=True, ramp_seconds=0.05, motor_ids=sender.H_CAN_IDS,
+                               current_limits=sender.walk_current_limits(),
+                               policy_slew_rad_s=np.deg2rad(200.0), stand_seconds=0.05,
+                               speed_abort_rad_s=np.deg2rad(400.0), soft_stop_s=soft_stop_s)
+            with path.open(encoding="utf-8") as handle:
+                rows = list(_csv.DictReader(handle))
+            abort = sender.abort_txt_path(path).read_text(encoding="utf-8")
+        return rows, abort, buffer.getvalue()
+
+    def test_abort_is_recorded_and_soft_stop_holds_then_zero(self):
+        rows, abort, text = self._abort_run(0.1)
+        self.assertIn("motion/current abort", abort)
+        soft = [r for r in rows if r["stage"] == "soft-stop"]
+        self.assertTrue(soft)
+        self.assertEqual(len(soft) % len(sender.H_CAN_IDS), 0)
+        self.assertIn("SOFT STOP complete", text)
+
+    def test_without_the_flag_there_is_no_soft_stop_but_the_abort_is_recorded(self):
+        rows, abort, text = self._abort_run(None)
+        self.assertIn("motion/current abort", abort)
+        self.assertFalse([r for r in rows if r["stage"] == "soft-stop"])
+        self.assertNotIn("SOFT STOP", text)
+
+    def test_soft_stop_ends_on_high_current(self):
+        base = AllAxesSlewTests._fake_bus(None, [])
+
+        class HotBus(base):
+            def state(self, _mid):
+                return SimpleNamespace(pos=0.0, spd=0.0, cur=20.0, err=0,
+                                       t=__import__("time").time())
+        rows, _abort, text = self._abort_run(0.5, HotBus)
+        self.assertIn("SOFT STOP ended early", text)
+        self.assertFalse([r for r in rows if r["stage"] == "soft-stop"])

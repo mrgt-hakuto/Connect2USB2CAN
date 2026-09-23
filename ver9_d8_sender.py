@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13_FLOORWALK_20260923_1800"
+BUILD_ID = "D10_13B_SOFTSTOP_20260923_1900"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -152,6 +152,21 @@ WALK_POLICY_SLEW_MAX_DPS = 200.0
 # the policy first catches its balance on the floor, then walks.
 WALK_DURATION_MAX_S = 15.0
 COMMAND_DELAY_MAX_S = 5.0
+# D10-13B (2026-09-23): every D10-13 policy stage on the floor ended within
+# 0.2-4.3 s on the 200 deg/s speed abort (last logged 186-211 deg/s), and the
+# zero-MIT cleanup that follows every abort dropped the robot: "the knees
+# collapsed" was the cleanup, not the policy.  The sim policy moves KFE at
+# ~250 deg/s (std), so 200 deg/s is below its own normal speed.
+#   --walk-speed-abort-dps S (with --walk-limits, explicit approval): raise the
+#     speed abort up to WALK_SPEED_ABORT_MAX_DPS.  The default stays 200.
+#   --soft-stop-seconds T (with --walk-limits): after a speed/current/origin
+#     abort in the policy stage, hold every axis where it stopped with the
+#     stand-hold gains for T s, then send the usual zero MIT.  Stale feedback,
+#     a motor error or a current above the table during the soft stop sends
+#     zero MIT at once.  Without the flag nothing changes.
+WALK_SPEED_ABORT_MAX_DPS = 400.0
+SOFT_STOP_MAX_S = 5.0
+SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort")
 # Printed every this many seconds during a long (floor) stand hold, so the
 # operator lowering the hoist can see the load arrive on the legs.
 STAND_PROGRESS_S = 2.0
@@ -1522,13 +1537,14 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits)
     if speed_abort_rad_s is not None:
         bus.speed_abort_rad_s = speed_abort_rad_s
     t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
+    abort_message=None
     # D10-8: every policy evaluation's full 42-dim observation and raw action,
     # so what the policy SAW can be judged from the saved log.
     obs_rows=[]
@@ -1735,41 +1751,48 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         command_started = False
         if command_delay_s is not None:
             print(f"COMMAND DELAY: zero command for the first {command_delay_s:g}s of the policy stage.")
-        while time.monotonic()<end:
-            time.sleep(max(0,nxt-time.monotonic())); tick=time.monotonic()
-            use_cmd = cmd if (command_delay_s is None or tick - policy_start >= command_delay_s) else zero_cmd
-            if command_delay_s is not None and not command_started and use_cmd is cmd:
-                print(f"COMMAND: vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f} from now "
-                      f"({tick - policy_start:.2f}s into the policy stage).")
-                command_started = True
-            _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),use_cmd.sample(tick),last)
-            if _o is not None:
-                obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
-            desired_target = out.joint_target_h_order[selected_index]
-            if policy_slew_rad_s is not None:
-                commanded_all = slew_all(commanded_all, out.joint_target_h_order,
-                                         policy_slew_rad_s, tick - previous_policy_tick)
-                targets = list(commanded_all)
-                commanded_target = targets[selected_index]
-            else:
-                commanded_target = slew_target(
-                    commanded_target, desired_target, ramp_rate, tick - previous_policy_tick
-                )
-                targets = list(out.joint_target_h_order)
-                targets[selected_index] = commanded_target
-            for fr in frames(targets, motor_ids): bus.send(fr)
-            rows.extend(axis_rows(tick, "policy", out.joint_target_h_order,
-                                  targets, bus, motor_ids))
-            progress = min(int(tick - (end - duration)), int(duration))
-            if progress != last_policy_progress:
-                print(
-                    f"POLICY progress: {progress}/{duration:g}s; "
-                    f"0x{selected_id:02X} desired={np.rad2deg(desired_target):+.2f}deg; "
-                    f"sent={np.rad2deg(commanded_target):+.2f}deg; "
-                    f"CAN tx={bus.tx_count}"
-                )
-                last_policy_progress = progress
-            last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
+        try:
+            while time.monotonic()<end:
+                time.sleep(max(0,nxt-time.monotonic())); tick=time.monotonic()
+                use_cmd = cmd if (command_delay_s is None or tick - policy_start >= command_delay_s) else zero_cmd
+                if command_delay_s is not None and not command_started and use_cmd is cmd:
+                    print(f"COMMAND: vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f} from now "
+                          f"({tick - policy_start:.2f}s into the policy stage).")
+                    command_started = True
+                _s,_o,out,plan=evaluate_cycle(policy,t265.latest(),bus.feedback(),use_cmd.sample(tick),last)
+                if _o is not None:
+                    obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
+                desired_target = out.joint_target_h_order[selected_index]
+                if policy_slew_rad_s is not None:
+                    commanded_all = slew_all(commanded_all, out.joint_target_h_order,
+                                             policy_slew_rad_s, tick - previous_policy_tick)
+                    targets = list(commanded_all)
+                    commanded_target = targets[selected_index]
+                else:
+                    commanded_target = slew_target(
+                        commanded_target, desired_target, ramp_rate, tick - previous_policy_tick
+                    )
+                    targets = list(out.joint_target_h_order)
+                    targets[selected_index] = commanded_target
+                for fr in frames(targets, motor_ids): bus.send(fr)
+                rows.extend(axis_rows(tick, "policy", out.joint_target_h_order,
+                                      targets, bus, motor_ids))
+                progress = min(int(tick - (end - duration)), int(duration))
+                if progress != last_policy_progress:
+                    print(
+                        f"POLICY progress: {progress}/{duration:g}s; "
+                        f"0x{selected_id:02X} desired={np.rad2deg(desired_target):+.2f}deg; "
+                        f"sent={np.rad2deg(commanded_target):+.2f}deg; "
+                        f"CAN tx={bus.tx_count}"
+                    )
+                    last_policy_progress = progress
+                last=out.action_raw; previous_policy_tick=tick; nxt+=PERIOD
+        except RuntimeError as error:
+            if soft_stop_s and is_soft_stop_abort(error):
+                print(f"ABORT in the policy stage: {error}")
+                abort_message = f"{type(error).__name__}: {error}"
+                soft_stop(bus, rows, motor_ids, current_limits, soft_stop_s)
+            raise
         selected_rows = rows_for_axis(rows, selected_id)
         max_tracking_rad, max_current_a, required_tracking_rad, tracking_verdict = policy_ramp_summary(
             selected_rows, initial_positions[selected_index], initial_targets[selected_index]
@@ -1796,9 +1819,22 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 f"max |current|={max_current_a:.2f}A; {tracking_verdict}."
             )
         print(f"POLICY complete: CAN tx={bus.tx_count}; sending selected-axis zero MIT cleanup.")
+    except BaseException as error:
+        # D10-13B: the abort reason used to exist only on the screen.
+        if abort_message is None:
+            abort_message = f"{type(error).__name__}: {error}"
+        raise
     finally:
         # Cleanup must never be skipped, including a stale-feedback or USB-open
         # failure.  Attempt all shutdown steps even if one of them fails.
+        if abort_message is not None and csv_path is not None:
+            try:
+                path = abort_txt_path(csv_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(time.strftime("%Y-%m-%d %H:%M:%S") + " " + abort_message + "\n",
+                                encoding="utf-8")
+            except Exception as error:
+                print(f"WARNING: abort record failed: {error}")
         if policy_slew_rad_s is not None and any(row[1] == "policy" for row in rows):
             try:
                 report_slew_gap(rows, motor_ids)
@@ -1848,6 +1884,61 @@ OBS_TERMS = (
 )
 OBS_JOINT_NAMES = ("LL_HR", "LR_HR", "LL_HAA", "LR_HAA", "LL_HFE", "LR_HFE",
                    "LL_KFE", "LR_KFE", "LL_FFE", "LR_FFE")
+
+
+def abort_txt_path(csv_path):
+    """The one-line abort record that belongs to one run CSV (D10-13B)."""
+    csv_path = Path(csv_path)
+    return csv_path.with_name(csv_path.stem + "_abort.txt")
+
+
+def is_soft_stop_abort(error):
+    """True for the aborts a soft stop may follow: speed, current, origin.
+
+    Stale feedback, a motor error or a lost route mean the feedback itself
+    cannot be trusted, so those always go straight to zero MIT.
+    """
+    return isinstance(error, RuntimeError) and str(error).startswith(SOFT_STOP_ABORT_PREFIXES)
+
+
+def soft_stop(bus, rows, motor_ids, current_limits, seconds):
+    """Hold every driven axis where it stopped, with the stand-hold gains.
+
+    Returns True when the hold ran for the full time, False when it ended
+    early (stale feedback, motor error, current above the table).  Either
+    way the caller's cleanup sends zero MIT afterwards.
+    """
+    targets = list(STAND_TARGET)
+    for mid in motor_ids:
+        state = bus.state(mid)
+        if state is None or time.time() - state.t > STALE_S or state.err:
+            print(f"SOFT STOP skipped: 0x{mid:02X} has no fresh error-free feedback; zero MIT now.")
+            return False
+        position, _velocity, _current = h_feedback(mid, state)
+        targets[H_CAN_IDS.index(mid)] = position
+    print(f"SOFT STOP: holding every axis where it stopped (stand-hold gains) for {seconds:g}s, "
+          "then zero MIT. Catch the body before it ends.")
+    end = time.monotonic() + seconds
+    next_tick = time.monotonic()
+    while time.monotonic() < end:
+        time.sleep(max(0.0, next_tick - time.monotonic()))
+        tick = time.monotonic()
+        for mid in motor_ids:
+            state = bus.state(mid)
+            if state is None or time.time() - state.t > STALE_S or state.err:
+                print(f"SOFT STOP ended early: 0x{mid:02X} stale feedback or motor error; zero MIT now.")
+                return False
+            limit = current_limits.get(mid, CURRENT_ABORT_A)
+            if abs(state.cur) > limit:
+                print(f"SOFT STOP ended early: 0x{mid:02X} cur={state.cur:+.2f}A above "
+                      f"{limit:.2f}A; zero MIT now.")
+                return False
+        for frame in frames(targets, motor_ids):
+            bus.send(frame)
+        rows.extend(axis_rows(tick, "soft-stop", targets, targets, bus, motor_ids))
+        next_tick += PERIOD
+    print(f"SOFT STOP complete after {seconds:g}s.")
+    return True
 
 
 def obs_csv_path(csv_path):
@@ -1940,6 +2031,9 @@ def analyze_csv(csv_path):
     kp_cmd = wire_command(motor_id, rows[0][5])[0]
     initial_position = rows[0][6]
     initial_target = rows[0][3]
+    abort_path = abort_txt_path(csv_path)
+    if abort_path.exists():
+        print(f"ABORT RECORD ({abort_path.name}): {abort_path.read_text(encoding='utf-8').strip()}")
     stages = ", ".join(
         f"{stage}={sum(1 for row in rows if row[1] == stage)}"
         for stage in dict.fromkeys(row[1] for row in rows)
@@ -2054,6 +2148,8 @@ def main():
     p.add_argument('--lean-sweep-deg', type=float, help=f'D10-11, with --floor-limits --stand-only: after the stand hold, add toe-down lean to both FFE at {LEAN_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {LEAN_SWEEP_MAX_DEG:g}) and log where the robot balances over its ankles')
     p.add_argument('--auto-lean-deg', type=float, help=f'D10-12, with --floor-limits or --walk-limits and --stand-seconds >= {AUTO_LEAN_START_S + 4:g}: from {AUTO_LEAN_START_S:g}s into the stand hold, lean both FFE toe-down until the ankles stop being pushed toe-up (0 < max <= {STAND_LEAN_MAX_DEG:g} deg); the policy starts from the leaned pose')
     p.add_argument('--walk-limits', action='store_true', help=f'D10-12, policy on the floor with the hoist rope attached: --floor-limits with KFE/FFE {WALK_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} A, speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} deg/s, --policy-slew-dps allowed up to {WALK_POLICY_SLEW_MAX_DPS:g}. Needs explicit user approval')
+    p.add_argument('--walk-speed-abort-dps', type=float, help=f'D10-13B, with --walk-limits: speed abort in deg/s ({np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}; default {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}). Needs explicit user approval')
+    p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
@@ -2085,14 +2181,28 @@ def main():
                     '--stand-seconds, without --hold-pose or --static-probe')
         if a.haa_close_deg is not None or a.sign_pose:
             p.error('--floor-limits is not for the hanging checks (--haa-close-deg, --sign-pose)')
+    for flag, value in (("--walk-speed-abort-dps", a.walk_speed_abort_dps),
+                        ("--soft-stop-seconds", a.soft_stop_seconds)):
+        if value is not None and not a.walk_limits:
+            p.error(f'{flag} is for the floor walking run: pass --walk-limits')
+    walk_speed_dps = float(np.rad2deg(WALK_SPEED_ABORT_RAD_S))
+    if a.walk_speed_abort_dps is not None:
+        if not walk_speed_dps <= a.walk_speed_abort_dps <= WALK_SPEED_ABORT_MAX_DPS:
+            p.error(f'--walk-speed-abort-dps must satisfy {walk_speed_dps:.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}')
+        walk_speed_dps = float(a.walk_speed_abort_dps)
+    if a.soft_stop_seconds is not None and not 0 < a.soft_stop_seconds <= SOFT_STOP_MAX_S:
+        p.error(f'--soft-stop-seconds must satisfy 0 < value <= {SOFT_STOP_MAX_S:g}')
     limits = (walk_current_limits() if a.walk_limits
               else floor_current_limits() if a.floor_limits
               else gravity_current_limits() if a.gravity_limits else default_current_limits())
     if a.walk_limits:
         print("WALK LIMITS: per-axis current abort " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS)
-            + f"; speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}deg/s; slew allowed up to "
+            + f"; speed abort {walk_speed_dps:.0f}deg/s; slew allowed up to "
             f"{WALK_POLICY_SLEW_MAX_DPS:g}deg/s. Keep the hoist rope attached.")
+        if a.soft_stop_seconds is not None:
+            print(f"SOFT STOP armed: after a speed/current/origin abort in the policy stage, "
+                  f"hold where it stopped for {a.soft_stop_seconds:g}s, then zero MIT.")
     elif a.floor_limits:
         print("FLOOR LIMITS: per-axis current abort " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS))
@@ -2282,6 +2392,7 @@ def main():
         stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target,
         haa_close_rad=haa_close_rad, lean_sweep_rad=lean_sweep_rad,
         auto_lean_rad=auto_lean_rad,
-        speed_abort_rad_s=WALK_SPEED_ABORT_RAD_S if a.walk_limits else None,
-        command_delay_s=a.command_delay_seconds)
+        speed_abort_rad_s=float(np.deg2rad(walk_speed_dps)) if a.walk_limits else None,
+        command_delay_s=a.command_delay_seconds,
+        soft_stop_s=a.soft_stop_seconds)
 if __name__=='__main__': sys.exit(main() or 0)
