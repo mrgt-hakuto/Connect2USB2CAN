@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_6_JOINTSIGN_20260923_1340"
+BUILD_ID = "D10_7_SIGNPOSE_20260923_1430"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -76,6 +76,51 @@ ALL_AXES_MAX_DELTA_DEG = 30.0
 # pose instead, holds it, and only then hands over to the slew-limited policy.
 STAND_MAX_SECONDS = 5.0
 STAND_TARGET = tuple(float(value) for value in DEFAULT_JOINT_POS)
+# D10-7 (2026-09-23): after the D10-6 joint-sign fix, the stand pose alone
+# cannot show a wrong HR/HAA sign -- both sit at 0 there.  The sign pose adds
+# the same small outward angle to HR (toes out) and HAA (legs open) on BOTH
+# sides.  In H coordinates the sim is left/right mirror symmetric, so a
+# correct build looks mirror symmetric; a leg that turns or swings INWARD
+# instead has a wrong sign on that axis.  Feedback cannot show this: the
+# position loop is closed in whatever frame it is given, so H feedback always
+# matches the H target.  Only the eye (or an external reference) can.
+SIGN_POSE_EXTRA_DEG = 8.0
+_SIGN_POSE_EXTRA = {"HR": SIGN_POSE_EXTRA_DEG, "HAA": SIGN_POSE_EXTRA_DEG}
+SIGN_POSE_TARGET = tuple(
+    STAND_TARGET[index] + float(np.deg2rad(_SIGN_POSE_EXTRA.get(name.split("_", 1)[1], 0.0)))
+    for index, name in enumerate(("LL_HR", "LR_HR", "LL_HAA", "LR_HAA", "LL_HFE", "LR_HFE",
+                                  "LL_KFE", "LR_KFE", "LL_FFE", "LR_FFE"))
+)
+# What a correct sign looks like for each positive (or negative) H angle.
+LOOK_BY_JOINT = {
+    "HR":  "toe turned OUTWARD (+)",
+    "HAA": "leg swung OUTWARD, away from the other leg (+)",
+    "HFE": "thigh FORWARD (-)",
+    "KFE": "knee bent, foot BACKWARD (+)",
+    "FFE": "toe UP (-)",
+}
+
+
+def joint_sign_line():
+    """One line naming every joint sign this build applies."""
+    return "JOINT SIGNS (motor = sign * H): " + ", ".join(
+        f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={H_BINDING_BY_ID[mid].sign:+d}"
+        for mid in H_CAN_IDS)
+
+
+def print_look_check(target):
+    """What the operator must SEE on both legs; the log cannot tell."""
+    print("LOOK CHECK (both legs must match, mirror images of each other):")
+    for suffix in ("HR", "HAA", "HFE", "KFE", "FFE"):
+        index = H_CAN_IDS.index(next(mid for mid in H_CAN_IDS
+                                     if H_BINDING_BY_ID[mid].name == "LL_" + suffix))
+        angle = np.rad2deg(target[index])
+        if abs(angle) < 0.5:
+            print(f"  {suffix:3s} target {angle:+5.1f}deg: straight (not checkable in this pose)")
+        else:
+            print(f"  {suffix:3s} target {angle:+5.1f}deg: {LOOK_BY_JOINT[suffix]}")
+    print("  A leg doing the OPPOSITE on one axis = wrong sign on that axis: "
+          "main power OFF, report which leg and which axis.")
 # A completed one-axis run is not evidence of position control if feedback
 # never departs its D7 origin by even one servo-feedback display increment.
 MIN_TRACKING_DEG = 0.1
@@ -1072,7 +1117,7 @@ def run_hold_pose(csv_path, duration, motor_ids=H_CAN_IDS, current_limits=None):
             print(f"WARNING: CSV cleanup failed: {error}")
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
@@ -1100,12 +1145,12 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         ))
         # With a stand stage the open-loop ramp goes to the sim default pose,
         # not to the policy's first output, so that is what the gate checks.
-        ramp_goal = STAND_TARGET if stand_seconds else tuple(initial_targets)
+        ramp_goal = tuple(stand_target) if stand_seconds else tuple(initial_targets)
         if stand_seconds:
             print("STAND TARGET (sim default pose, no MIT sent yet): " + ", ".join(
                 f"0x{mid:02X} target={np.rad2deg(target):+.1f}deg "
                 f"delta={np.rad2deg(target-position):+.1f}deg"
-                for mid, target, position in zip(H_CAN_IDS, STAND_TARGET, initial_positions)
+                for mid, target, position in zip(H_CAN_IDS, stand_target, initial_positions)
             ))
         violations = all_axes_prearm_violations(ramp_goal, initial_positions)
         if violations:
@@ -1205,14 +1250,15 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 time.sleep(max(0, stand_next - time.monotonic()))
                 tick = time.monotonic()
                 bus.feedback()
-                for fr in frames(STAND_TARGET, motor_ids):
+                for fr in frames(stand_target, motor_ids):
                     bus.send(fr)
-                rows.extend(axis_rows(tick, "stand-hold", STAND_TARGET, STAND_TARGET,
+                rows.extend(axis_rows(tick, "stand-hold", stand_target, stand_target,
                                       bus, motor_ids))
                 stand_next += PERIOD
             print(f"STAND HOLD complete: CAN tx={bus.tx_count}.")
+            print_look_check(stand_target)
             report_hold_pose([row for row in rows if row[1] == "stand-hold"],
-                             STAND_TARGET, motor_ids, current_limits)
+                             stand_target, motor_ids, current_limits)
             if stand_only:
                 print("STAND ONLY: no policy stage. Sending zero MIT cleanup.")
                 return
@@ -1386,8 +1432,18 @@ def analyze_csv(csv_path):
         else:
             stand = [row for row in rows if row[1] == "stand-hold"]
             if stand:
-                print("STAND HOLD (sim default pose):")
-                report_hold_pose(stand, STAND_TARGET, logged_ids, default_current_limits())
+                # The stand target is read from the CSV itself: --sign-pose
+                # (D10-7) holds a different pose than the sim default.
+                stand_target = list(STAND_TARGET)
+                for mid in logged_ids:
+                    axis_stand = rows_for_axis(stand, mid)
+                    if axis_stand:
+                        stand_target[H_CAN_IDS.index(mid)] = axis_stand[0][3]
+                stand_target = tuple(stand_target)
+                label = "sim default pose" if np.allclose(stand_target, STAND_TARGET) else "sign pose"
+                print(f"STAND HOLD ({label}):")
+                print_look_check(stand_target)
+                report_hold_pose(stand, stand_target, logged_ids, default_current_limits())
             report_all_axes(rows, positions, targets, logged_ids)
             report_slew_gap(rows, logged_ids)
         return 0
@@ -1435,11 +1491,13 @@ def main():
     p.add_argument('--gravity-limits', action='store_true', help=f'per-axis current abort sized to this robot static gravity load instead of the flat {CURRENT_ABORT_A:.1f}A one-axis limit. Requires --all-axes. Needs explicit user approval: it RAISES the abort on load-bearing axes')
     p.add_argument('--policy-slew-dps', type=float, help=f'with --arm --all-axes (required there): rate-limit EVERY axis target in the policy stage to this many deg/s, 0 < value <= {POLICY_SLEW_MAX_DPS:g}. Removes the ramp->policy step that tripped D10-3 R3/R4')
     p.add_argument('--stand-seconds', type=float, help=f'with --arm --all-axes: ramp to the sim default pose (HAA 0, HFE -10, KFE +20, FFE -10 deg) over --ramp-seconds, hold it this long (0 < value <= {STAND_MAX_SECONDS:g}), then start the slew-limited policy from there')
+    p.add_argument('--sign-pose', action='store_true', help=f'with --stand-only (D10-7): hold the sim default pose plus {SIGN_POSE_EXTRA_DEG:g} deg outward on HR and HAA of both legs, so every joint sign can be checked by eye')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
     current_mode = 'hold-pose' if a.hold_pose else 'static-probe' if a.static_probe else 'arm' if a.arm else 'preflight' if a.preflight else 'none'
     print(f"ver9_d8_sender build={BUILD_ID}; mode={current_mode}")
+    print(joint_sign_line())
     if a.analyze: return analyze_csv(a.analyze)
     if a.preview: preview(); return 0
     if not (a.arm or a.preflight): p.error('--arm is required for transmission; use --preflight for a receive-only live check')
@@ -1477,6 +1535,12 @@ def main():
                              or a.vx or a.vy or a.wz):
             p.error('--stand-only runs no policy: leave --duration, --policy-slew-dps '
                     'and --vx/--vy/--wz unset')
+    if a.sign_pose and not a.stand_only:
+        p.error('--sign-pose is a look-only check: it requires --stand-only (no policy stage)')
+    stand_target = SIGN_POSE_TARGET if a.sign_pose else STAND_TARGET
+    if a.sign_pose:
+        print(f"SIGN POSE: sim default pose + {SIGN_POSE_EXTRA_DEG:g}deg outward on HR and HAA, "
+              "both legs. Watch both legs; they must be mirror images.")
     if a.hold_pose:
         if not a.arm or a.preflight:
             p.error('--hold-pose requires --arm and cannot be combined with --preflight')
@@ -1531,7 +1595,7 @@ def main():
         # A path is still supplied so evidence is written consistently, but
         # no policy frame or cleanup frame is put on CAN.
         run(a.package, 0., a.csv or Path('logs/d9_preflight.csv'), a.vx, a.vy, a.wz, transmit=False,
-            stand_seconds=a.stand_seconds)
+            stand_seconds=a.stand_seconds, stand_target=stand_target)
         return 0
     if a.stand_only:
         if not a.csv: p.error('--csv is required with --arm')
@@ -1561,5 +1625,5 @@ def main():
         transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids,
         current_limits=limits,
         policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)),
-        stand_seconds=a.stand_seconds, stand_only=a.stand_only)
+        stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target)
 if __name__=='__main__': sys.exit(main() or 0)

@@ -168,7 +168,12 @@ class D7Console:
                 joint = BY_ID.get(motor_id)
                 label = joint.name if joint else "未登録ID"
                 ok, detail = self.state_line(joint) if joint else (False, "")
-                print(f"  0x{motor_id:02X} {label:7s} {count:3d}件 {hz:5.1f}Hz  {detail.split('  ', 1)[-1] if detail else ''}")
+                h_text = ""
+                if joint:
+                    h_state = self.buses[channel].state(motor_id)
+                    if h_state is not None:
+                        h_text = f"  H={joint.sign * h_state.pos:+.1f}deg"
+                print(f"  0x{motor_id:02X} {label:7s} {count:3d}件 {hz:5.1f}Hz  {detail.split('  ', 1)[-1] if detail else ''}{h_text}")
                 if not ok:
                     print("    <-- D7を続けない")
             self._record("scan ch=" + str(channel) + " found=" + ",".join(
@@ -190,6 +195,16 @@ class D7Console:
             )
             print("OK: 登録済み10軸を受信し、このプロセスの送信経路を確定しました。")
             self._record("route confirmed " + layout)
+            # D10-7 (2026-09-23): D10-6 lost five of ten hand-moved readings
+            # because only |pos| > 45 deg was written.  Every axis is now
+            # recorded, in the motor's own frame and in the H (sim) frame.
+            positions = []
+            for joint in JOINTS:
+                state = self.buses[route[joint.motor_id]].state(joint.motor_id)
+                if state is not None:
+                    positions.append(f"0x{joint.motor_id:02X} {joint.name} motor={state.pos:+.1f}deg "
+                                     f"H={joint.sign * state.pos:+.1f}deg")
+            self._record("scan pos " + "; ".join(positions))
             off_zero = []
             for joint in JOINTS:
                 state = self.buses[route[joint.motor_id]].state(joint.motor_id)

@@ -1260,3 +1260,63 @@ class JointSignRoundTripTests(unittest.TestCase):
             wire = sender.wire_command(mid, sender.STAND_TARGET[index])[2]
             sign = sender.H_BINDING_BY_ID[mid].sign
             self.assertAlmostEqual(wire, sign * sender.STAND_TARGET[index], places=2)
+
+
+class SignPoseTests(unittest.TestCase):
+    """D10-7 (2026-09-23): a stand-only pose in which every joint sign shows."""
+
+    def test_sign_pose_adds_outward_hr_and_haa_only(self):
+        for index, mid in enumerate(sender.H_CAN_IDS):
+            suffix = sender.H_BINDING_BY_ID[mid].name.split("_", 1)[1]
+            extra = np.rad2deg(sender.SIGN_POSE_TARGET[index] - sender.STAND_TARGET[index])
+            self.assertAlmostEqual(extra, 8.0 if suffix in ("HR", "HAA") else 0.0)
+            self.assertLessEqual(abs(np.rad2deg(sender.SIGN_POSE_TARGET[index])),
+                                 sender.ALL_AXES_MAX_TARGET_DEG)
+
+    def test_sign_pose_is_mirrored_on_the_wire_for_lr_hr(self):
+        index = sender.H_CAN_IDS.index(0x13)  # LR_HR, sign -1
+        wire = sender.wire_command(0x13, sender.SIGN_POSE_TARGET[index])[2]
+        self.assertAlmostEqual(np.rad2deg(wire), -8.0, places=1)
+
+    def test_sign_pose_requires_stand_only(self):
+        argv = ["ver9_d8_sender.py", "--arm", "--all-axes", "--stand-seconds", "2",
+                "--sign-pose", "--policy-slew-dps", "20", "--duration", "2",
+                "--package", "x", "--ramp-seconds", "10", "--csv", "x.csv"]
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+
+    def test_sign_pose_reaches_run(self):
+        argv = ["ver9_d8_sender.py", "--arm", "--all-axes", "--gravity-limits",
+                "--stand-seconds", "3", "--stand-only", "--sign-pose",
+                "--package", "x", "--ramp-seconds", "10", "--csv", "x.csv"]
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stdout", out):
+            sender.main()
+        self.assertEqual(run.call_args.kwargs["stand_target"], sender.SIGN_POSE_TARGET)
+        self.assertIn("JOINT SIGNS", out.getvalue())
+        self.assertIn("0x2A LR_HFE=-1", out.getvalue())
+
+    def test_analyze_reads_the_sign_pose_from_the_csv(self):
+        import contextlib
+        rows = ["tick,stage,sent_motor_id,desired_target_rad,requested_target_rad,"
+                "wire_target_motor_rad,feedback_position_rad,feedback_velocity_rad_s,"
+                "feedback_current_h_a"]
+        for tick in range(10):
+            for index, mid in enumerate(sender.H_CAN_IDS):
+                target = sender.SIGN_POSE_TARGET[index]
+                rows.append(f"{tick*0.02},stand-hold,0x{mid:02X},{target},{target},0,{target},0,0.2")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sign.csv"
+            path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                sender.analyze_csv(path)
+        text = buffer.getvalue()
+        self.assertIn("STAND HOLD (sign pose)", text)
+        self.assertIn("LOOK CHECK", text)
+        self.assertIn("toe turned OUTWARD", text)
+        self.assertIn("droop=  +0.00deg", text)
