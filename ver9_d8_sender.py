@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13E_TILTGAIN_20260923_2200"
+BUILD_ID = "D10_13F_GATE45_20260924"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -177,7 +177,9 @@ SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort",
 START_GATE_MIN_DEG = 2.0
 START_GATE_MAX_DEG = 10.0
 START_GATE_HOLD_S = 0.5
-START_GATE_TIMEOUT_S = 20.0
+# D10-13F (2026-09-24): 3 of 8 D10-13E starts ended on the 20 s timeout while the
+# operator was still bringing a backward-leaning body (-6..-13 deg) upright.
+START_GATE_TIMEOUT_S = 45.0
 START_GATE_PRINT_S = 0.5
 # D10-13C: Windows time.monotonic() (Python 3.10, GetTickCount64) and the
 # default 15.6 ms timer made the 50 Hz loop run at 0/16/31/47 ms steps.
