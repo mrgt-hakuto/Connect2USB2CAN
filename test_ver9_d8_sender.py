@@ -1343,3 +1343,113 @@ class ObservationSidecarTests(unittest.TestCase):
         self.assertAlmostEqual(tilt, 0.0, places=3)
         self.assertIn("5 policy tick(s)", buffer.getvalue())
         self.assertIn("LL_KFE=+0.0", buffer.getvalue())
+
+
+class HaaSweepTests(unittest.TestCase):
+    """D10-9 (2026-09-23): close both HAA from the stand pose and log where the feet meet."""
+
+    _BASE = ["ver9_d8_sender.py", "--arm", "--all-axes", "--gravity-limits",
+             "--stand-seconds", "2", "--stand-only", "--package", "x",
+             "--ramp-seconds", "10", "--csv", "x.csv"]
+
+    def test_targets_move_only_haa_inward_and_stop_at_the_end(self):
+        indices = sender.haa_indices()
+        self.assertEqual([sender.H_BINDING_BY_ID[sender.H_CAN_IDS[i]].name for i in indices],
+                         ["LL_HAA", "LR_HAA"])
+        half = sender.haa_sweep_targets(sender.STAND_TARGET, np.deg2rad(16), 4.0)
+        end = sender.haa_sweep_targets(sender.STAND_TARGET, np.deg2rad(16), 100.0)
+        for index, (h, e, s) in enumerate(zip(half, end, sender.STAND_TARGET)):
+            if index in indices:
+                self.assertAlmostEqual(np.rad2deg(h - s), -4.0 * sender.HAA_SWEEP_DPS)
+                self.assertAlmostEqual(np.rad2deg(e - s), -16.0)
+            else:
+                self.assertEqual(h, s)
+                self.assertEqual(e, s)
+
+    def test_block_rule(self):
+        four = np.deg2rad(4.0)
+        droop = [-np.deg2rad(3.0)] * 50           # gravity pulls inward: never a block
+        self.assertIsNone(sender.haa_block_tick(droop))
+        nine = [0.0] * 5 + [four * 1.1] * 9 + [0.0]
+        self.assertIsNone(sender.haa_block_tick(nine))
+        ten = [0.0] * 5 + [four * 1.1] * 10
+        self.assertEqual(sender.haa_block_tick(ten), 5)
+
+    def test_flag_scope_and_range(self):
+        bad = [
+            [a for a in self._BASE if a != "--stand-only"] + ["--haa-close-deg", "10",
+                                                               "--policy-slew-dps", "20", "--duration", "2"],
+            self._BASE + ["--haa-close-deg", "10", "--sign-pose"],
+            self._BASE + ["--haa-close-deg", "0"],
+            self._BASE + ["--haa-close-deg", "17"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+
+    def test_flag_reaches_run_in_radians(self):
+        out = io.StringIO()
+        with patch.object(sys, "argv", self._BASE + ["--haa-close-deg", "16"]), \
+                patch.object(sender, "run") as run, patch("sys.stdout", out):
+            sender.main()
+        self.assertAlmostEqual(run.call_args.kwargs["haa_close_rad"], np.deg2rad(16.0))
+        self.assertEqual(run.call_args.kwargs["stand_target"], sender.STAND_TARGET)
+        self.assertIn("HAA SWEEP planned", out.getvalue())
+
+    def test_without_the_flag_nothing_changes(self):
+        with patch.object(sys, "argv", self._BASE), patch.object(sender, "run") as run, \
+                patch("sys.stdout", io.StringIO()):
+            sender.main()
+        self.assertIsNone(run.call_args.kwargs["haa_close_rad"])
+
+    def test_run_freezes_at_the_first_block_and_analyze_finds_it(self):
+        import contextlib
+        import csv as _csv
+        sent = []
+        first = SimpleNamespace(joint_target_h_order=(0.0,) * 10, action_raw=np.zeros(10))
+        # The fake bus always reports every axis at 0 rad, so the legs "stop" at 0
+        # while the HAA target keeps moving inward: a block at feedback 0.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sweep.csv"
+            buffer = io.StringIO()
+            with patch.object(sender, "HPolicy"), \
+                    patch.object(sender, "DualBus", AllAxesSlewTests._fake_bus(None, sent)), \
+                    patch.object(sender, "RealT265", AllAxesSlewTests._FakeT265), \
+                    patch.object(sender, "evaluate_cycle",
+                                 side_effect=lambda *a, **k: (None, None, first, None)), \
+                    patch.object(sender, "HAA_SWEEP_DPS", 400.0), \
+                    patch.object(sender, "HAA_SWEEP_HOLD_S", 0.5), \
+                    contextlib.redirect_stdout(buffer):
+                sender.run(Path(directory), 0.0, path, 0.0, 0.0, 0.0, transmit=True,
+                           ramp_seconds=0.1, motor_ids=sender.H_CAN_IDS,
+                           current_limits=sender.gravity_current_limits(),
+                           stand_seconds=0.1, stand_only=True, haa_close_rad=np.deg2rad(16.0))
+                with path.open(encoding="utf-8") as handle:
+                    rows = list(_csv.DictReader(handle))
+                analyzed = io.StringIO()
+                with contextlib.redirect_stdout(analyzed):
+                    sender.analyze_csv(path)
+        text = buffer.getvalue()
+        stages = [r["stage"] for r in rows]
+        self.assertIn("haa-sweep", stages)
+        self.assertIn("haa-hold", stages)
+        self.assertIn("HAA CONTACT", text)
+        self.assertRegex(text, r"BLOCKED at feedback [+-]0\.0deg")
+        haa_ids = {f"0x{sender.H_CAN_IDS[i]:02X}" for i in sender.haa_indices()}
+        last_tick = max(float(r["tick"]) for r in rows)
+        ids = [f"0x{m:02X}" for m in sender.H_CAN_IDS]
+        for r in rows:
+            index = ids.index(r["sent_motor_id"])
+            target = float(r["requested_target_rad"])
+            if r["sent_motor_id"] in haa_ids:
+                self.assertGreaterEqual(target, -np.deg2rad(16.0) - 1e-9)
+                if float(r["tick"]) == last_tick:
+                    # Frozen where the legs are (0), not pressed on toward the target.
+                    self.assertAlmostEqual(target, 0.0)
+            elif r["stage"].startswith("haa-"):
+                self.assertAlmostEqual(target, sender.STAND_TARGET[index])
+        self.assertIn("HAA SWEEP (D10-9)", analyzed.getvalue())
+        self.assertIn("BLOCKED", analyzed.getvalue())

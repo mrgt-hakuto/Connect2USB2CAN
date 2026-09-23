@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_8_POSREL_20260923_1530"
+BUILD_ID = "D10_9_HAASWEEP_20260923_1500"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -99,6 +99,94 @@ LOOK_BY_JOINT = {
     "KFE": "knee bent, foot BACKWARD (+)",
     "FFE": "toe UP (-)",
 }
+# D10-9 (2026-09-23): in D10-8 the policy closed the legs and the feet hit
+# each other (R1 at HAA feedback -4 / -9 deg, R2 around LR_HAA -15 deg).  The
+# sim walks with BOTH HAA at -13.5..-16.4 deg (golden.npz, vx 0.5), where the
+# URDF puts the ankle joints ~18 cm apart, with self-collision enabled and no
+# contact.  --haa-close-deg answers, from the log, the one question that
+# decides whether the trained gait fits this machine: at what HAA angle do the
+# real feet touch?  After the stand hold (sim default pose), both HAA targets
+# move inward together at HAA_SWEEP_DPS.  Gravity pulls a hanging leg INWARD
+# (D10-8 droop -2.2..-5.1 deg), so a free leg sits at or inside its target; a
+# leg that falls BEHIND its target by HAA_BLOCK_DEG for HAA_BLOCK_TICKS ticks
+# is being stopped by something (the other foot).  Then both HAA targets are
+# frozen where the legs actually are, so the feet are not pressed together.
+HAA_SWEEP_DPS = 2.0
+HAA_CLOSE_MAX_DEG = 16.0
+HAA_BLOCK_DEG = 4.0
+HAA_BLOCK_RAD = float(np.deg2rad(HAA_BLOCK_DEG))
+HAA_BLOCK_TICKS = 10
+HAA_SWEEP_HOLD_S = 2.0
+
+
+def haa_indices():
+    """H-order indices of LL_HAA and LR_HAA."""
+    return tuple(H_CAN_IDS.index(mid) for mid in H_CAN_IDS
+                 if H_BINDING_BY_ID[mid].name.endswith("_HAA"))
+
+
+def haa_sweep_targets(stand_target, close_rad, elapsed_s, rate_rad_s=None):
+    """The stand pose with both HAA moved inward (negative H) by the swept amount."""
+    rate = float(np.deg2rad(HAA_SWEEP_DPS)) if rate_rad_s is None else rate_rad_s
+    delta = min(abs(close_rad), rate * max(elapsed_s, 0.0))
+    out = list(stand_target)
+    for index in haa_indices():
+        out[index] = stand_target[index] - delta
+    return tuple(out)
+
+
+def haa_block_tick(errors_rad, threshold_rad=None, ticks=None):
+    """First index at which feedback-minus-target stayed > threshold for `ticks` ticks.
+
+    errors_rad[i] = feedback - target in H.  Inward is negative for both HAA,
+    so a POSITIVE error means the leg is less far in than it was told to be.
+    Returns the index where the run of blocked ticks STARTED, or None.
+    """
+    threshold = HAA_BLOCK_RAD if threshold_rad is None else threshold_rad
+    need = HAA_BLOCK_TICKS if ticks is None else ticks
+    run = 0
+    for index, error in enumerate(errors_rad):
+        run = run + 1 if error > threshold else 0
+        if run >= need:
+            return index - need + 1
+    return None
+
+
+def report_haa_sweep(rows):
+    """What the HAA sweep found, from CSV rows (live and --analyze)."""
+    sweep = [row for row in rows if row[1] in ("haa-sweep", "haa-hold")]
+    if not sweep:
+        return None
+    print(f"HAA SWEEP (D10-9): both HAA inward at {HAA_SWEEP_DPS:g}deg/s from the stand pose; "
+          f"blocked = feedback {HAA_BLOCK_DEG:g}deg short of target for {HAA_BLOCK_TICKS} ticks.")
+    found = {}
+    for index in haa_indices():
+        mid = H_CAN_IDS[index]
+        name = H_BINDING_BY_ID[mid].name
+        axis = rows_for_axis(sweep, mid)
+        if not axis:
+            print(f"  0x{mid:02X} {name:7s} no sweep samples")
+            continue
+        errors = [row[6] - row[4] for row in axis]
+        at = haa_block_tick(errors)
+        inmost = min(row[6] for row in axis)
+        peak = max(abs(row[8]) for row in axis)
+        last_target = min(row[4] for row in axis)
+        if at is None:
+            print(f"  0x{mid:02X} {name:7s} NOT blocked: target reached {np.rad2deg(last_target):+.1f}deg, "
+                  f"feedback most inward {np.rad2deg(inmost):+.1f}deg, max|I|={peak:.2f}A")
+        else:
+            row = axis[at]
+            found[name] = row[6]
+            print(f"  0x{mid:02X} {name:7s} BLOCKED at feedback {np.rad2deg(row[6]):+.1f}deg "
+                  f"(target {np.rad2deg(row[4]):+.1f}deg, t={row[0] - axis[0][0]:.2f}s into the sweep); "
+                  f"most inward {np.rad2deg(inmost):+.1f}deg, max|I|={peak:.2f}A")
+    if found:
+        print("HAA SWEEP RESULT: the legs were stopped before the sweep end. Sim gait holds both "
+              "HAA at -13.5..-16.4deg; compare the BLOCKED angles above with that.")
+    else:
+        print("HAA SWEEP RESULT: no leg was blocked over the whole sweep.")
+    return found
 
 
 def joint_sign_line():
@@ -1117,7 +1205,77 @@ def run_hold_pose(csv_path, duration, motor_ids=H_CAN_IDS, current_limits=None):
             print(f"WARNING: CSV cleanup failed: {error}")
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET):
+def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
+    """D10-9: close both HAA from the stand pose until the sweep end or a block.
+
+    The block check stays on through the end hold, so a leg that is stopped
+    only at the very end of the sweep is still caught and released.
+    """
+    indices = haa_indices()
+    rate = float(np.deg2rad(HAA_SWEEP_DPS))
+    print(f"HAA SWEEP: both HAA inward to {-np.rad2deg(abs(close_rad)):+.1f}deg at "
+          f"{HAA_SWEEP_DPS:g}deg/s. Hands off. Say out loud when the feet touch.")
+    start = time.monotonic()
+    nxt = start
+    errors = {index: [] for index in indices}
+    targets = tuple(stand_target)
+    sweeping = True
+    blocked_found = False
+    hold_end = None
+    pending_freeze = None
+    last_second = -1
+    while True:
+        time.sleep(max(0, nxt - time.monotonic()))
+        tick = time.monotonic()
+        feedback = bus.feedback()
+        if not blocked_found:
+            if sweeping:
+                targets = haa_sweep_targets(stand_target, close_rad, tick - start, rate)
+            for index in indices:
+                errors[index].append(feedback[H_CAN_IDS[index]].position - targets[index])
+            blocked = [index for index in indices if haa_block_tick(errors[index]) is not None]
+            if blocked:
+                print("HAA CONTACT: " + ", ".join(
+                    f"{H_BINDING_BY_ID[H_CAN_IDS[index]].name} feedback="
+                    f"{np.rad2deg(feedback[H_CAN_IDS[index]].position):+.1f}deg "
+                    f"target={np.rad2deg(targets[index]):+.1f}deg" for index in indices)
+                    + f"; blocked: {', '.join(H_BINDING_BY_ID[H_CAN_IDS[i]].name for i in blocked)}. "
+                    "Both HAA frozen where they are.")
+                # This tick is still sent and logged with the target that was
+                # checked (so --analyze finds the same block tick); the frozen
+                # target takes over from the next tick, 20 ms later.
+                frozen = list(targets)
+                for index in indices:
+                    frozen[index] = feedback[H_CAN_IDS[index]].position
+                pending_freeze = tuple(frozen)
+                blocked_found = True
+                sweeping = False
+                hold_end = tick + HAA_SWEEP_HOLD_S
+            elif sweeping and tick - start >= abs(close_rad) / rate:
+                print(f"HAA SWEEP reached {np.rad2deg(targets[indices[0]]):+.1f}deg; "
+                      f"holding {HAA_SWEEP_HOLD_S:g}s (block check still on).")
+                sweeping = False
+                hold_end = tick + HAA_SWEEP_HOLD_S
+        stage = "haa-sweep" if sweeping else "haa-hold"
+        for fr in frames(targets, motor_ids):
+            bus.send(fr)
+        rows.extend(axis_rows(tick, stage, targets, targets, bus, motor_ids))
+        if pending_freeze is not None:
+            targets = pending_freeze
+            pending_freeze = None
+        second = int(tick - start)
+        if sweeping and second != last_second:
+            print(f"HAA SWEEP progress: {second}s; target={np.rad2deg(targets[indices[0]]):+.1f}deg; "
+                  + ", ".join(f"{H_BINDING_BY_ID[H_CAN_IDS[i]].name}="
+                              f"{np.rad2deg(feedback[H_CAN_IDS[i]].position):+.1f}deg" for i in indices))
+            last_second = second
+        if hold_end is not None and tick >= hold_end:
+            break
+        nxt += PERIOD
+    report_haa_sweep(rows)
+
+
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None):
     current_limits = dict(current_limits or default_current_limits())
     policy=HPolicy(package); bus=DualBus(current_limits); t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
@@ -1271,6 +1429,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             print_look_check(stand_target)
             report_hold_pose([row for row in rows if row[1] == "stand-hold"],
                              stand_target, motor_ids, current_limits)
+            if haa_close_rad:
+                run_haa_sweep(bus, rows, stand_target, haa_close_rad, motor_ids)
             if stand_only:
                 print("STAND ONLY: no policy stage. Sending zero MIT cleanup.")
                 return
@@ -1433,7 +1593,7 @@ def report_observation(path):
     print(f"OBSERVATION ({path.name}): {len(policy)} policy tick(s).")
     if initial:
         rel = [float(initial[0][f"obs_pos_rel_{joint}"]) for joint in OBS_JOINT_NAMES]
-        print("  initial pos_rel (deg): " + ", ".join(
+        print("  initial pos_rel at program start, before the ramp (deg): " + ", ".join(
             f"{joint}={np.rad2deg(value):+.1f}" for joint, value in zip(OBS_JOINT_NAMES, rel)))
     if not policy:
         return None
@@ -1537,6 +1697,7 @@ def analyze_csv(csv_path):
                 report_hold_pose(stand, stand_target, logged_ids, default_current_limits())
             report_all_axes(rows, positions, targets, logged_ids)
             report_slew_gap(rows, logged_ids)
+            report_haa_sweep(rows)
         sidecar = obs_csv_path(csv_path)
         if sidecar.exists():
             report_observation(sidecar)
@@ -1588,6 +1749,7 @@ def main():
     p.add_argument('--policy-slew-dps', type=float, help=f'with --arm --all-axes (required there): rate-limit EVERY axis target in the policy stage to this many deg/s, 0 < value <= {POLICY_SLEW_MAX_DPS:g}. Removes the ramp->policy step that tripped D10-3 R3/R4')
     p.add_argument('--stand-seconds', type=float, help=f'with --arm --all-axes: ramp to the sim default pose (HAA 0, HFE -10, KFE +20, FFE -10 deg) over --ramp-seconds, hold it this long (0 < value <= {STAND_MAX_SECONDS:g}), then start the slew-limited policy from there')
     p.add_argument('--sign-pose', action='store_true', help=f'with --stand-only (D10-7): hold the sim default pose plus {SIGN_POSE_EXTRA_DEG:g} deg outward on HR and HAA of both legs, so every joint sign can be checked by eye')
+    p.add_argument('--haa-close-deg', type=float, help=f'with --stand-only (D10-9): after the stand hold, move BOTH HAA inward together at {HAA_SWEEP_DPS:g} deg/s up to this many deg (0 < value <= {HAA_CLOSE_MAX_DEG:g}) and log the angle at which the feet stop each other; both HAA freeze there')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -1633,6 +1795,16 @@ def main():
                     'and --vx/--vy/--wz unset')
     if a.sign_pose and not a.stand_only:
         p.error('--sign-pose is a look-only check: it requires --stand-only (no policy stage)')
+    if a.haa_close_deg is not None:
+        if not a.stand_only or a.sign_pose:
+            p.error('--haa-close-deg is a no-policy check: it requires --stand-only and '
+                    'cannot be combined with --sign-pose')
+        if not 0 < a.haa_close_deg <= HAA_CLOSE_MAX_DEG:
+            p.error(f'--haa-close-deg must satisfy 0 < value <= {HAA_CLOSE_MAX_DEG:g}')
+        print(f"HAA SWEEP planned: after the stand hold, both HAA inward to "
+              f"{-a.haa_close_deg:+.1f}deg at {HAA_SWEEP_DPS:g}deg/s "
+              f"({a.haa_close_deg / HAA_SWEEP_DPS:.1f}s), stop and freeze at the first block.")
+    haa_close_rad = None if a.haa_close_deg is None else float(np.deg2rad(a.haa_close_deg))
     stand_target = SIGN_POSE_TARGET if a.sign_pose else STAND_TARGET
     if a.sign_pose:
         print(f"SIGN POSE: sim default pose + {SIGN_POSE_EXTRA_DEG:g}deg outward on HR and HAA, "
@@ -1721,5 +1893,6 @@ def main():
         transmit=True, ramp_seconds=a.ramp_seconds, motor_ids=motor_ids,
         current_limits=limits,
         policy_slew_rad_s=None if a.policy_slew_dps is None else float(np.deg2rad(a.policy_slew_dps)),
-        stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target)
+        stand_seconds=a.stand_seconds, stand_only=a.stand_only, stand_target=stand_target,
+        haa_close_rad=haa_close_rad)
 if __name__=='__main__': sys.exit(main() or 0)
