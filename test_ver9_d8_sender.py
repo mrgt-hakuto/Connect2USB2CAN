@@ -2334,3 +2334,42 @@ class NoAngleStopsTests(unittest.TestCase):
                 sender.main()
         run.assert_not_called()
         self.assertFalse(sender.ANGLE_STOPS_OFF)
+
+
+class CrouchClampTests(unittest.TestCase):
+    """D10-13K (2026-09-24): crouch start pose and the safe target clamp."""
+
+    def setUp(self):
+        self.addCleanup(sender.set_zero_offset, None)
+
+    def test_crouch_keeps_the_sole_parallel(self):
+        t = np.rad2deg(sender.crouch_target())
+        names = [sender.H_BINDING_BY_ID[m].name for m in sender.H_CAN_IDS]
+        for leg in ("LL", "LR"):
+            total = sum(t[names.index(f"{leg}_{j}")] for j in ("HFE", "KFE", "FFE"))
+            self.assertAlmostEqual(total, 0.0, delta=0.02)
+        self.assertAlmostEqual(t[names.index("LL_HAA")], -6.0, places=6)
+        self.assertAlmostEqual(t[names.index("LL_KFE")], 33.0, delta=0.02)
+
+    def test_clamp(self):
+        sender.set_zero_offset("cad_fk")
+        sender.apply_knee_trim(19.0, 16.0)
+        raw = [0.0] * 10
+        names = [sender.H_BINDING_BY_ID[m].name for m in sender.H_CAN_IDS]
+        raw[names.index("LL_KFE")] = np.deg2rad(-30.0)
+        raw[names.index("LR_HAA")] = np.deg2rad(-20.0)
+        raw[names.index("LL_HFE")] = np.deg2rad(-30.0)
+        out = np.rad2deg(sender.safe_clamp(raw))
+        self.assertAlmostEqual(out[names.index("LL_KFE")], 6.7 + 2.0, delta=0.05)   # D7 +2
+        self.assertAlmostEqual(out[names.index("LR_HAA")], -8.0, places=6)
+        self.assertAlmostEqual(out[names.index("LL_HFE")], -30.0, places=6)          # untouched
+
+    def test_flags_reach_run(self):
+        argv = KneeTrimTests._WALK + ["--knee-trim-deg", "19", "16", "--start-pose", "crouch", "--safe-clamp"]
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "k.csv") for a in argv]
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, patch("sys.stdout", io.StringIO()):
+                sender.main()
+        kw = run.call_args.kwargs
+        self.assertTrue(kw["clamp_targets"])
+        self.assertAlmostEqual(np.rad2deg(kw["stand_target"][sender.H_CAN_IDS.index(0x1A)]), 33.0, delta=0.02)

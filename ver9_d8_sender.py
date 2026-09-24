@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13J_NOANGLESTOPS_20260924"
+BUILD_ID = "D10_13K_CROUCH_20260924"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -265,6 +265,36 @@ KFE_HYPEREXTEND_MAX_DEG = 20.0
 # knee past straight).  Only a 120 deg-from-D7 catastrophe stop is kept.  Tilt,
 # current, speed, stale and motor-error aborts all stay; --tilt-abort-deg is required.
 ANGLE_STOPS_OFF = False
+# D10-13K (2026-09-24): every floor run started with the same reflex -- knee
+# straighten (KFE -0.6..-0.9), toe push, hip back -- the sim's landing move
+# (episodes start in the air with random velocities).  ONNX with the robot
+# standing still: from the sim default pose KFE = -0.84/-0.59; from a crouch
+# nearer the sim walking pose (golden median HFE +10, KFE +13, FFE -14, HAA
+# -15 rel.) KFE = -0.07/+0.04.  --start-pose crouch holds (rel. to default)
+# HAA -6 (feet clear: they touch at -8.5..-11), HFE +6, KFE +13, FFE -19
+# (sagittal sum unchanged, so the sole stays parallel to the body).
+CROUCH_REL_DEG = {"HAA": -6.0, "HFE": 6.0, "KFE": 13.0, "FFE": -19.0}
+# --safe-clamp: the policy's knee target never goes past straight (D7 angle
+# >= KNEE_CLAMP_D7_DEG) and HAA never closes past HAA_CLAMP_DEG (feet touch).
+KNEE_CLAMP_D7_DEG = 2.0
+HAA_CLAMP_DEG = -8.0
+
+
+def crouch_target():
+    return tuple(STAND_TARGET[i] + float(np.deg2rad(CROUCH_REL_DEG.get(joint_suffix(mid), 0.0)))
+                 for i, mid in enumerate(H_CAN_IDS))
+
+
+def safe_clamp(targets):
+    """Knee not past straight, HAA not into the other foot (sim-frame targets)."""
+    out = list(targets)
+    for i, mid in enumerate(H_CAN_IDS):
+        suffix = joint_suffix(mid)
+        if suffix == "KFE":
+            out[i] = max(out[i], float(ZERO_OFFSET_RAD[i] + np.deg2rad(KNEE_CLAMP_D7_DEG)))
+        elif suffix == "HAA":
+            out[i] = max(out[i], float(np.deg2rad(HAA_CLAMP_DEG)))
+    return tuple(out)
 ANGLE_STOPS_OFF_BACKSTOP_DEG = 120.0
 TILT_ABORT_MIN_DEG = 15.0
 TILT_ABORT_MAX_DEG = 40.0
@@ -1699,7 +1729,7 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False,origin_ref_stand=False,tilt_abort_rad=None,policy_gain_scale=None):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False,origin_ref_stand=False,tilt_abort_rad=None,policy_gain_scale=None,clamp_targets=False):
     timer_state = enable_fine_timer() if fine_timer else None
     timing_rows = []
     current_limits = dict(current_limits or default_current_limits())
@@ -1993,8 +2023,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 if _o is not None:
                     obs_rows.append((tick, "policy", *map(float, _o), *map(float, out.action_raw)))
                 desired_target = out.joint_target_h_order[selected_index]
+                live_targets = safe_clamp(out.joint_target_h_order) if clamp_targets else out.joint_target_h_order
                 if policy_slew_rad_s is not None:
-                    commanded_all = slew_all(commanded_all, out.joint_target_h_order,
+                    commanded_all = slew_all(commanded_all, live_targets,
                                              policy_slew_rad_s, tick - previous_policy_tick)
                     targets = list(commanded_all)
                     commanded_target = targets[selected_index]
@@ -2575,6 +2606,8 @@ def main():
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
     p.add_argument('--knee-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13G, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_KFE offset (+ = hold the knee that much straighter; {KNEE_TRIM_MIN_DEG:g}..{KNEE_TRIM_MAX_DEG:g})')
+    p.add_argument('--start-pose', choices=('default', 'crouch'), default='default', help='D10-13K: hold/start pose. crouch = sim default + HAA -6, HFE +6, KFE +13, FFE -19 deg (nearer the sim walking pose)')
+    p.add_argument('--safe-clamp', action='store_true', help=f'D10-13K, with --walk-limits: policy knee target never past straight (D7 >= {KNEE_CLAMP_D7_DEG:g} deg), HAA target >= {HAA_CLAMP_DEG:g} deg')
     p.add_argument('--no-angle-stops', action='store_true', help='D10-13J, with --origin-ref stand and --tilt-abort-deg: no joint-angle stops (only 120 deg from D7); tilt/current/speed/stale aborts stay')
     p.add_argument('--knee-hyperextend-deg', type=float, help=f'D10-13I, with --origin-ref stand: knee may go this far past straight (D7) before the abort ({10:g} < value <= {KFE_HYPEREXTEND_MAX_DEG:g}; default 10). Only if the knee can mechanically bend that far backward')
     p.add_argument('--ankle-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13H, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_FFE offset (same correction as --knee-trim-deg, on the ankle; + = hold the toe that much further up)')
@@ -2733,6 +2766,16 @@ def main():
               f"({a.haa_close_deg / HAA_SWEEP_DPS:.1f}s), stop and freeze at the first block.")
     haa_close_rad = None if a.haa_close_deg is None else float(np.deg2rad(a.haa_close_deg))
     stand_target = SIGN_POSE_TARGET if a.sign_pose else STAND_TARGET
+    if a.start_pose == 'crouch':
+        if a.sign_pose or a.stand_knee_deg is not None or a.stand_lean_deg is not None:
+            p.error('--start-pose crouch replaces --sign-pose/--stand-knee-deg/--stand-lean-deg')
+        stand_target = crouch_target()
+        print("START POSE crouch: " + ", ".join(f"{H_BINDING_BY_ID[mid].name}={np.rad2deg(t):+.1f}deg"
+                                                for mid, t in zip(H_CAN_IDS, stand_target)) + " (sim frame)")
+    if a.safe_clamp and not a.walk_limits:
+        p.error('--safe-clamp is for the floor walking run: pass --walk-limits')
+    if a.safe_clamp:
+        print(f"SAFE CLAMP: knee target >= {KNEE_CLAMP_D7_DEG:g}deg from straight (D7), HAA target >= {HAA_CLAMP_DEG:g}deg.")
     auto_lean_rad = None
     if a.auto_lean_deg is not None:
         if not a.floor_limits or a.stand_seconds is None or a.stand_seconds < AUTO_LEAN_START_S + 4:
@@ -2911,5 +2954,6 @@ def main():
         fine_timer=a.fine_timer,
         origin_ref_stand=(a.origin_ref == 'stand'),
         tilt_abort_rad=None if a.tilt_abort_deg is None else float(np.deg2rad(a.tilt_abort_deg)),
-        policy_gain_scale=a.policy_gain_scale)
+        policy_gain_scale=a.policy_gain_scale,
+        clamp_targets=a.safe_clamp)
 if __name__=='__main__': sys.exit(main() or 0)
