@@ -2279,3 +2279,58 @@ class AnkleTrimTests(unittest.TestCase):
         self.assertIn("ANKLE TRIM", out.getvalue())
         self.assertIn("LL_FFE=+28.4", meta)
         self.assertIn("LL_KFE=-12.3", meta)
+
+
+class KneeGuardTests(unittest.TestCase):
+    """D10-13I (2026-09-24): optional wider knee hyperextension stop."""
+
+    def tearDown(self):
+        sender.KFE_HYPEREXTEND_DEG = 10.0
+
+    def test_flag_widens_the_stop(self):
+        argv = KneeTrimTests._WALK + ["--knee-trim-deg", "19", "16", "--origin-ref", "stand",
+                                      "--tilt-abort-deg", "30", "--knee-hyperextend-deg", "20"]
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "g.csv") for a in argv]
+            with patch.object(sys, "argv", argv), patch.object(sender, "run"), patch("sys.stdout", io.StringIO()):
+                sender.main()
+        self.assertEqual(sender.KFE_HYPEREXTEND_DEG, 20.0)
+        self.assertIsNone(sender.origin_violation(0x1A, np.deg2rad(-12.3), np.deg2rad(13.3)))
+        self.assertIsNotNone(sender.origin_violation(0x1A, np.deg2rad(-21.0), np.deg2rad(13.3)))
+
+    def test_refusals(self):
+        for extra in (["--knee-hyperextend-deg", "25", "--origin-ref", "stand", "--tilt-abort-deg", "30"],
+                      ["--knee-hyperextend-deg", "15"]):
+            with patch.object(sys, "argv", KneeTrimTests._WALK + extra), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
+        self.assertEqual(sender.KFE_HYPEREXTEND_DEG, 10.0)
+
+
+class NoAngleStopsTests(unittest.TestCase):
+    """D10-13J (2026-09-24): joint-angle stops off for the last run."""
+
+    def tearDown(self):
+        sender.ANGLE_STOPS_OFF = False
+
+    def test_flag(self):
+        argv = KneeTrimTests._WALK + ["--knee-trim-deg", "19", "16", "--origin-ref", "stand",
+                                      "--tilt-abort-deg", "30", "--no-angle-stops"]
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "j.csv") for a in argv]
+            with patch.object(sys, "argv", argv), patch.object(sender, "run"), patch("sys.stdout", io.StringIO()):
+                sender.main()
+        self.assertTrue(sender.ANGLE_STOPS_OFF)
+        self.assertIsNone(sender.origin_violation(0x1A, np.deg2rad(-30.0), np.deg2rad(13.3)))
+        self.assertIsNone(sender.origin_violation(0x21, np.deg2rad(70.0), np.deg2rad(-12.9)))
+        self.assertIsNotNone(sender.origin_violation(0x21, np.deg2rad(121.0), np.deg2rad(-12.9)))
+
+    def test_refused_without_tilt(self):
+        with patch.object(sys, "argv", KneeTrimTests._WALK + ["--no-angle-stops"]), \
+                patch.object(sender, "run") as run, patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sender.main()
+        run.assert_not_called()
+        self.assertFalse(sender.ANGLE_STOPS_OFF)

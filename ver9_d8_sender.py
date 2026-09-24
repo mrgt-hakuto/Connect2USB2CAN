@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13H_ANKLETRIM_20260924"
+BUILD_ID = "D10_13J_NOANGLESTOPS_20260924"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -255,6 +255,17 @@ STAND_RAMP_MAX_DELTA_DEG = 45.0
 #     real torque per commanded Kp is 1.0-1.6x the sim, S = 0.7 undoes most of it.
 ORIGIN_BACKSTOP_DEG = 75.0
 KFE_HYPEREXTEND_DEG = 10.0
+# D10-13I: with --knee-trim-deg the held knee is only 11-13 deg from straight and
+# the policy's first knee move (-17..-26 deg) passed -10 in 2 of 3 G runs.
+# --knee-hyperextend-deg raises the stop, only up to this, only if the knee can
+# mechanically bend that far backward.
+KFE_HYPEREXTEND_MAX_DEG = 20.0
+# D10-13J (last run before the presentation, operator request): --no-angle-stops
+# turns off the joint-angle stops (45 deg from the stand pose, 75 deg backstop,
+# knee past straight).  Only a 120 deg-from-D7 catastrophe stop is kept.  Tilt,
+# current, speed, stale and motor-error aborts all stay; --tilt-abort-deg is required.
+ANGLE_STOPS_OFF = False
+ANGLE_STOPS_OFF_BACKSTOP_DEG = 120.0
 TILT_ABORT_MIN_DEG = 15.0
 TILT_ABORT_MAX_DEG = 40.0
 POLICY_GAIN_SCALE_MIN = 0.5
@@ -514,6 +525,10 @@ def origin_violation(mid, d7_rad, center_rad=None):
         if abs(d7_rad) > ORIGIN_ABORT_RAD:
             return (f"{np.rad2deg(d7_rad):+.1f}deg from the D7 origin "
                     f"(limit {np.rad2deg(ORIGIN_ABORT_RAD):.0f}deg)")
+        return None
+    if ANGLE_STOPS_OFF:
+        if abs(d7_rad) > np.deg2rad(ANGLE_STOPS_OFF_BACKSTOP_DEG):
+            return f"{np.rad2deg(d7_rad):+.1f}deg from the D7 origin (last-resort stop {ANGLE_STOPS_OFF_BACKSTOP_DEG:g}deg)"
         return None
     if abs(d7_rad - center_rad) > ORIGIN_ABORT_RAD:
         return (f"{np.rad2deg(d7_rad - center_rad):+.1f}deg from the stand pose "
@@ -2560,6 +2575,8 @@ def main():
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
     p.add_argument('--knee-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13G, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_KFE offset (+ = hold the knee that much straighter; {KNEE_TRIM_MIN_DEG:g}..{KNEE_TRIM_MAX_DEG:g})')
+    p.add_argument('--no-angle-stops', action='store_true', help='D10-13J, with --origin-ref stand and --tilt-abort-deg: no joint-angle stops (only 120 deg from D7); tilt/current/speed/stale aborts stay')
+    p.add_argument('--knee-hyperextend-deg', type=float, help=f'D10-13I, with --origin-ref stand: knee may go this far past straight (D7) before the abort ({10:g} < value <= {KFE_HYPEREXTEND_MAX_DEG:g}; default 10). Only if the knee can mechanically bend that far backward')
     p.add_argument('--ankle-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13H, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_FFE offset (same correction as --knee-trim-deg, on the ankle; + = hold the toe that much further up)')
     p.add_argument('--zero-offset', choices=sorted(ZERO_OFFSET_PRESETS_DEG), help='D10-13D, with --all-axes: map the D7 origin (legs straight by eye) to the sim joint zero (CAD pose) with a fixed per-joint offset; see ZERO_OFFSET_PRESETS_DEG')
     p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
@@ -2619,6 +2636,20 @@ def main():
             p.error('--origin-ref stand is for the floor walking run: pass --walk-limits')
         if a.tilt_abort_deg is None:
             p.error('--origin-ref stand loosens the origin abort; it requires --tilt-abort-deg')
+    global ANGLE_STOPS_OFF, KFE_HYPEREXTEND_DEG
+    if a.no_angle_stops:
+        if a.origin_ref != 'stand' or a.tilt_abort_deg is None:
+            p.error('--no-angle-stops needs --origin-ref stand and --tilt-abort-deg')
+        ANGLE_STOPS_OFF = True
+        print(f"NO ANGLE STOPS: joint-angle stops off (only {ANGLE_STOPS_OFF_BACKSTOP_DEG:g}deg from D7). "
+              "Tilt, current, speed, stale and motor-error aborts stay. Keep the rope on.")
+    if a.knee_hyperextend_deg is not None:
+        if a.origin_ref != 'stand':
+            p.error('--knee-hyperextend-deg needs --origin-ref stand')
+        if not 10.0 < a.knee_hyperextend_deg <= KFE_HYPEREXTEND_MAX_DEG:
+            p.error(f'--knee-hyperextend-deg must satisfy 10 < value <= {KFE_HYPEREXTEND_MAX_DEG:g}')
+        KFE_HYPEREXTEND_DEG = float(a.knee_hyperextend_deg)
+        print(f"KNEE STOP: knee may go {KFE_HYPEREXTEND_DEG:g}deg past straight (D7) before the abort.")
     if a.tilt_abort_deg is not None and not TILT_ABORT_MIN_DEG <= a.tilt_abort_deg <= TILT_ABORT_MAX_DEG:
         p.error(f'--tilt-abort-deg must satisfy {TILT_ABORT_MIN_DEG:g} <= value <= {TILT_ABORT_MAX_DEG:g}')
     if a.policy_gain_scale is not None and not POLICY_GAIN_SCALE_MIN <= a.policy_gain_scale <= POLICY_GAIN_SCALE_MAX:
