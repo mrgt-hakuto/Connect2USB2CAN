@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13K_CROUCH_20260924"
+BUILD_ID = "D10_13L_WIDE_20260925"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -165,6 +165,23 @@ COMMAND_DELAY_MAX_S = 5.0
 #     a motor error or a current above the table during the soft stop sends
 #     zero MIT at once.  Without the flag nothing changes.
 WALK_SPEED_ABORT_MAX_DPS = 400.0
+# D10-13L (2026-09-25): the sim walk of H_eff13p5@2999 (golden, vx 0.5) is above the walk
+# limits most of the time: FFE >10 A for 38-39% of the time (p99 21-23 A), KFE >200 deg/s for
+# 50-59% (p99 421-467 deg/s), and most floor runs ended on a current abort near those values.
+# --wide-limits (with --walk-limits and --tilt-abort-deg, explicit approval, rope and power
+# cut staffed) raises the per-axis current abort to just under the policy's own effort
+# (AK80-9 13.5 N*m = 25.8 A) or to the sim p99 with margin, the speed abort default to
+# 900 deg/s and the allowed slew to 1000 deg/s.  Tilt, stale feedback, motor error, CAN and
+# angle stops are unchanged.  Without the flag nothing changes.
+WIDE_CURRENT_ABORT_A_BY_JOINT = {
+    "HR":   6.0,
+    "HAA": 10.0,
+    "HFE": 24.0,
+    "KFE": 16.0,
+    "FFE": 24.0,
+}
+WIDE_SPEED_ABORT_DPS = 900.0
+WIDE_POLICY_SLEW_MAX_DPS = 1000.0
 SOFT_STOP_MAX_S = 5.0
 SOFT_STOP_ABORT_PREFIXES = ("motion/current abort", "origin/pre-arm pose abort", "tilt abort")
 # D10-13C (2026-09-23): the only long policy stage so far (7.4 s of stepping
@@ -729,9 +746,11 @@ def run_lean_sweep(bus, rows, stand_target, max_rad, motor_ids):
     return report_lean_sweep(rows)
 
 
-def walk_current_limits():
-    """D10-12: --floor-limits with KFE/FFE at 10 A for a policy run on the floor."""
-    return {mid: WALK_CURRENT_ABORT_A_BY_JOINT[joint_suffix(mid)] for mid in H_CAN_IDS}
+def walk_current_limits(wide=False):
+    """D10-12: --floor-limits with KFE/FFE at 10 A for a policy run on the floor.
+    D10-13L: wide=True uses WIDE_CURRENT_ABORT_A_BY_JOINT (--wide-limits)."""
+    table = WIDE_CURRENT_ABORT_A_BY_JOINT if wide else WALK_CURRENT_ABORT_A_BY_JOINT
+    return {mid: table[joint_suffix(mid)] for mid in H_CAN_IDS}
 
 
 def auto_lean_step(lean_rad, ffe_errors_rad, dt_s, max_rad):
@@ -2603,6 +2622,7 @@ def main():
     p.add_argument('--auto-lean-deg', type=float, help=f'D10-12, with --floor-limits or --walk-limits and --stand-seconds >= {AUTO_LEAN_START_S + 4:g}: from {AUTO_LEAN_START_S:g}s into the stand hold, lean both FFE toe-down until the ankles stop being pushed toe-up (0 < max <= {STAND_LEAN_MAX_DEG:g} deg); the policy starts from the leaned pose')
     p.add_argument('--walk-limits', action='store_true', help=f'D10-12, policy on the floor with the hoist rope attached: --floor-limits with KFE/FFE {WALK_CURRENT_ABORT_A_BY_JOINT["KFE"]:g} A, speed abort {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} deg/s, --policy-slew-dps allowed up to {WALK_POLICY_SLEW_MAX_DPS:g}. Needs explicit user approval')
     p.add_argument('--walk-speed-abort-dps', type=float, help=f'D10-13B, with --walk-limits: speed abort in deg/s ({np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}; default {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}). Needs explicit user approval')
+    p.add_argument('--wide-limits', action='store_true', help=f'D10-13L, with --walk-limits and --tilt-abort-deg: current abort {", ".join(f"{k} {v:g}A" for k, v in WIDE_CURRENT_ABORT_A_BY_JOINT.items())}, speed abort default {WIDE_SPEED_ABORT_DPS:g} deg/s, slew allowed up to {WIDE_POLICY_SLEW_MAX_DPS:g} deg/s. Needs explicit user approval, rope and power cut staffed')
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
     p.add_argument('--knee-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13G, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_KFE offset (+ = hold the knee that much straighter; {KNEE_TRIM_MIN_DEG:g}..{KNEE_TRIM_MAX_DEG:g})')
@@ -2647,15 +2667,20 @@ def main():
                     '--stand-seconds, without --hold-pose or --static-probe')
         if a.haa_close_deg is not None or a.sign_pose:
             p.error('--floor-limits is not for the hanging checks (--haa-close-deg, --sign-pose)')
+    if a.wide_limits and (not a.walk_limits or a.tilt_abort_deg is None):
+        p.error('--wide-limits needs --walk-limits and --tilt-abort-deg')
     for flag, value in (("--walk-speed-abort-dps", a.walk_speed_abort_dps),
                         ("--soft-stop-seconds", a.soft_stop_seconds)):
         if value is not None and not a.walk_limits:
             p.error(f'{flag} is for the floor walking run: pass --walk-limits')
     walk_speed_dps = float(np.rad2deg(WALK_SPEED_ABORT_RAD_S))
+    speed_max_dps = WIDE_SPEED_ABORT_DPS if a.wide_limits else WALK_SPEED_ABORT_MAX_DPS
     if a.walk_speed_abort_dps is not None:
-        if not walk_speed_dps <= a.walk_speed_abort_dps <= WALK_SPEED_ABORT_MAX_DPS:
-            p.error(f'--walk-speed-abort-dps must satisfy {walk_speed_dps:.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}')
+        if not walk_speed_dps <= a.walk_speed_abort_dps <= speed_max_dps:
+            p.error(f'--walk-speed-abort-dps must satisfy {walk_speed_dps:.0f} <= value <= {speed_max_dps:g}')
         walk_speed_dps = float(a.walk_speed_abort_dps)
+    elif a.wide_limits:
+        walk_speed_dps = WIDE_SPEED_ABORT_DPS
     if a.start_gate_deg is not None:
         if not a.walk_limits:
             p.error('--start-gate-deg is for the floor walking run: pass --walk-limits')
@@ -2689,14 +2714,17 @@ def main():
         p.error(f'--policy-gain-scale must satisfy {POLICY_GAIN_SCALE_MIN:g} <= value <= {POLICY_GAIN_SCALE_MAX:g}')
     if a.soft_stop_seconds is not None and not 0 < a.soft_stop_seconds <= SOFT_STOP_MAX_S:
         p.error(f'--soft-stop-seconds must satisfy 0 < value <= {SOFT_STOP_MAX_S:g}')
-    limits = (walk_current_limits() if a.walk_limits
+    limits = (walk_current_limits(a.wide_limits) if a.walk_limits
               else floor_current_limits() if a.floor_limits
               else gravity_current_limits() if a.gravity_limits else default_current_limits())
     if a.walk_limits:
         print("WALK LIMITS: per-axis current abort " + ", ".join(
             f"0x{mid:02X} {H_BINDING_BY_ID[mid].name}={limits[mid]:.1f}A" for mid in H_CAN_IDS)
             + f"; speed abort {walk_speed_dps:.0f}deg/s; slew allowed up to "
-            f"{WALK_POLICY_SLEW_MAX_DPS:g}deg/s. Keep the hoist rope attached.")
+            f"{WIDE_POLICY_SLEW_MAX_DPS if a.wide_limits else WALK_POLICY_SLEW_MAX_DPS:g}deg/s. Keep the hoist rope attached.")
+        if a.wide_limits:
+            print("WIDE LIMITS (D10-13L): current/speed/slew near the sim walk. Tilt, stale, motor-error, "
+                  "CAN and angle stops unchanged. Rope and power cut must be staffed.")
         if a.soft_stop_seconds is not None:
             print(f"SOFT STOP armed: after a speed/current/origin/tilt abort in the policy stage, "
                   f"hold where it stopped for {a.soft_stop_seconds:g}s, then zero MIT.")
@@ -2725,7 +2753,8 @@ def main():
               "values are still far under the trained policy's own effort limit "
               "(AK10-9 42.1A, AK80-9 25.8A). Speed abort, stale feedback, motor "
               "error and origin aborts are unchanged.")
-    slew_max = WALK_POLICY_SLEW_MAX_DPS if a.walk_limits else POLICY_SLEW_MAX_DPS
+    slew_max = (WIDE_POLICY_SLEW_MAX_DPS if a.wide_limits
+                else WALK_POLICY_SLEW_MAX_DPS if a.walk_limits else POLICY_SLEW_MAX_DPS)
     if a.command_delay_seconds is not None:
         if not a.walk_limits:
             p.error('--command-delay-seconds is for the floor walking run: pass --walk-limits')

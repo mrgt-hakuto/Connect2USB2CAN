@@ -2373,3 +2373,56 @@ class CrouchClampTests(unittest.TestCase):
         kw = run.call_args.kwargs
         self.assertTrue(kw["clamp_targets"])
         self.assertAlmostEqual(np.rad2deg(kw["stand_target"][sender.H_CAN_IDS.index(0x1A)]), 33.0, delta=0.02)
+
+
+class WideLimitsTests(unittest.TestCase):
+    """D10-13L (2026-09-25): --wide-limits raises current/speed/slew for the floor walk."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "5"]
+
+    def _main(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", out):
+            sender.main()
+        return run.call_args.kwargs, out.getvalue()
+
+    def test_default_walk_is_unchanged(self):
+        kw, text = self._main(self._WALK)
+        self.assertEqual(kw["current_limits"], sender.walk_current_limits())
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(200.0))
+        self.assertNotIn("WIDE LIMITS", text)
+
+    def test_wide_table_speed_and_slew(self):
+        argv = self._WALK + ["--wide-limits", "--tilt-abort-deg", "30"]
+        argv[argv.index("--policy-slew-dps") + 1] = "800"
+        kw, text = self._main(argv)
+        wide = sender.walk_current_limits(True)
+        self.assertEqual(kw["current_limits"], wide)
+        for mid in sender.H_CAN_IDS:
+            self.assertEqual(wide[mid], sender.WIDE_CURRENT_ABORT_A_BY_JOINT[sender.joint_suffix(mid)])
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(900.0))
+        self.assertAlmostEqual(kw["policy_slew_rad_s"], np.deg2rad(800.0))
+        self.assertIn("WIDE LIMITS", text)
+        kw, _ = self._main(self._WALK + ["--wide-limits", "--tilt-abort-deg", "30",
+                                         "--walk-speed-abort-dps", "600"])
+        self.assertAlmostEqual(kw["speed_abort_rad_s"], np.deg2rad(600.0))
+
+    def test_refusals(self):
+        floor = [a if a != "--walk-limits" else "--floor-limits" for a in self._WALK]
+        floor[floor.index("200")] = "60"
+        slew_too_high = self._WALK + ["--wide-limits", "--tilt-abort-deg", "30"]
+        slew_too_high[slew_too_high.index("--policy-slew-dps") + 1] = "1001"
+        bad = [
+            self._WALK + ["--wide-limits"],                                  # no tilt abort
+            floor + ["--wide-limits", "--tilt-abort-deg", "30"],             # no walk limits
+            self._WALK + ["--wide-limits", "--tilt-abort-deg", "30", "--walk-speed-abort-dps", "901"],
+            slew_too_high,
+            self._WALK + ["--walk-speed-abort-dps", "600"],                  # 600 only with wide
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
