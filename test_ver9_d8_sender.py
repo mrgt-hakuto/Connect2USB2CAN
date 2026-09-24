@@ -2251,3 +2251,31 @@ class KneeTrimTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     sender.main()
             run.assert_not_called()
+
+
+class AnkleTrimTests(unittest.TestCase):
+    """D10-13H (2026-09-24): the same sagittal correction on FFE instead of KFE."""
+
+    def setUp(self):
+        self.addCleanup(sender.set_zero_offset, None)
+
+    def test_ankle_trim_moves_only_ffe(self):
+        sender.set_zero_offset("cad_fk")
+        sender.apply_joint_trim("FFE", 19.0, 16.0)
+        self.assertAlmostEqual(np.rad2deg(sender.zero_offset_rad(0x2B)), 28.4, places=3)
+        self.assertAlmostEqual(np.rad2deg(sender.zero_offset_rad(0x22)), 24.1, places=3)
+        self.assertAlmostEqual(np.rad2deg(sender.zero_offset_rad(0x1A)), -12.3, places=3)
+        # LL_FFE sign -1: sim -10 deg = D7 -38.4 deg -> motor +38.4.
+        self.assertAlmostEqual(np.rad2deg(sender.wire_command(0x2B, np.deg2rad(-10.0))[2]), 38.4, delta=0.1)
+
+    def test_flag(self):
+        argv = KneeTrimTests._WALK + ["--ankle-trim-deg", "19", "16"]
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "a.csv") for a in argv]
+            out = io.StringIO()
+            with patch.object(sys, "argv", argv), patch.object(sender, "run"), patch("sys.stdout", out):
+                sender.main()
+            meta = (Path(directory) / "a_meta.txt").read_text(encoding="utf-8")
+        self.assertIn("ANKLE TRIM", out.getvalue())
+        self.assertIn("LL_FFE=+28.4", meta)
+        self.assertIn("LL_KFE=-12.3", meta)

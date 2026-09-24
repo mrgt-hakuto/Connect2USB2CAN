@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13G_KNEETRIM_20260924"
+BUILD_ID = "D10_13H_ANKLETRIM_20260924"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -213,14 +213,24 @@ KNEE_TRIM_MIN_DEG = -10.0
 KNEE_TRIM_MAX_DEG = 25.0
 
 
+# D10-13H (2026-09-24): the knee trim made joints and T265 agree on the floor
+# (-19/-16 -> -3/-2 deg), but the knee then sits 13/11 deg from straight and
+# the policy's usual first move (knee -17..-26 deg) drove it 12 deg past
+# straight (G1_2).  The operator sees the knee bent ~10 deg = the D7 reading,
+# so the knee encoder is right; --ankle-trim-deg puts the same correction on
+# FFE instead and leaves the knee where the sim holds it.
 def apply_knee_trim(left_deg, right_deg):
-    """Add a per-leg trim to the active LL/LR_KFE offsets (degrees)."""
+    return apply_joint_trim("KFE", left_deg, right_deg)
+
+
+def apply_joint_trim(joint, left_deg, right_deg):
+    """Add a per-leg trim to the active LL/LR_<joint> offsets (degrees)."""
     global ZERO_OFFSET_RAD
     for deg in (left_deg, right_deg):
         if not KNEE_TRIM_MIN_DEG <= deg <= KNEE_TRIM_MAX_DEG:
             raise ValueError(f"knee trim must satisfy {KNEE_TRIM_MIN_DEG:g} <= value <= {KNEE_TRIM_MAX_DEG:g}")
     table = ZERO_OFFSET_RAD.copy()
-    for name, deg in (("LL_KFE", left_deg), ("LR_KFE", right_deg)):
+    for name, deg in ((f"LL_{joint}", left_deg), (f"LR_{joint}", right_deg)):
         index = [H_BINDING_BY_ID[mid].name for mid in H_CAN_IDS].index(name)
         table[index] += np.deg2rad(deg)
     ZERO_OFFSET_RAD = table
@@ -2550,6 +2560,7 @@ def main():
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
     p.add_argument('--knee-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13G, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_KFE offset (+ = hold the knee that much straighter; {KNEE_TRIM_MIN_DEG:g}..{KNEE_TRIM_MAX_DEG:g})')
+    p.add_argument('--ankle-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13H, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_FFE offset (same correction as --knee-trim-deg, on the ankle; + = hold the toe that much further up)')
     p.add_argument('--zero-offset', choices=sorted(ZERO_OFFSET_PRESETS_DEG), help='D10-13D, with --all-axes: map the D7 origin (legs straight by eye) to the sim joint zero (CAD pose) with a fixed per-joint offset; see ZERO_OFFSET_PRESETS_DEG')
     p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
@@ -2795,8 +2806,17 @@ def main():
                   + "/".join(f"{np.rad2deg(zero_offset_rad(mid)):+.1f}" for mid in (0x1A, 0x12))
                   + " deg; the stand pose holds the knees "
                   + "/".join(f"{d:g}" for d in a.knee_trim_deg) + " deg straighter.")
-    elif a.knee_trim_deg is not None:
-        p.error('--knee-trim-deg needs --zero-offset')
+        if a.ankle_trim_deg is not None:
+            try:
+                apply_joint_trim("FFE", *a.ankle_trim_deg)
+            except ValueError as error:
+                p.error(f'--ankle-trim-deg: {error}')
+            print("ANKLE TRIM: LL_FFE/LR_FFE offset now "
+                  + "/".join(f"{np.rad2deg(zero_offset_rad(mid)):+.1f}" for mid in (0x2B, 0x22))
+                  + " deg; the stand pose holds the toes "
+                  + "/".join(f"{d:g}" for d in a.ankle_trim_deg) + " deg further up (knee unchanged).")
+    elif a.knee_trim_deg is not None or a.ankle_trim_deg is not None:
+        p.error('--knee-trim-deg/--ankle-trim-deg need --zero-offset')
     if a.csv and (a.arm or a.preflight) and not a.analyze:
         fresh = unique_csv_path(a.csv)
         if fresh != Path(a.csv):
