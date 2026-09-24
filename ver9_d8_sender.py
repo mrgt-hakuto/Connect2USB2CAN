@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13F_GATE45_20260924"
+BUILD_ID = "D10_13G_KNEETRIM_20260924"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -202,6 +202,28 @@ ZERO_OFFSET_PRESETS_DEG = {
                "LL_FFE": 9.4, "LR_FFE": 8.1},
 }
 ZERO_OFFSET_RAD = np.zeros(10)   # H order; sim_angle = D7-origin angle + this
+# D10-13G (2026-09-24): in every loaded stand hold of D10-13D/E, the sagittal
+# joint sum (HFE+KFE+FFE, sim frame) said the sole was 11-22 deg toe-up while
+# the T265 said the torso was upright (sole flat => pitch + sum = 0); with the
+# feet unloaded the two agree within 3 deg.  The operator sees the knee bent
+# too far.  --knee-trim-deg L R adds L/R to the LL/LR_KFE offset: + means "the
+# real knee is bent more than the encoder says", so the stand pose is held
+# with the knee that much straighter.  Opt-in, with --zero-offset only.
+KNEE_TRIM_MIN_DEG = -10.0
+KNEE_TRIM_MAX_DEG = 25.0
+
+
+def apply_knee_trim(left_deg, right_deg):
+    """Add a per-leg trim to the active LL/LR_KFE offsets (degrees)."""
+    global ZERO_OFFSET_RAD
+    for deg in (left_deg, right_deg):
+        if not KNEE_TRIM_MIN_DEG <= deg <= KNEE_TRIM_MAX_DEG:
+            raise ValueError(f"knee trim must satisfy {KNEE_TRIM_MIN_DEG:g} <= value <= {KNEE_TRIM_MAX_DEG:g}")
+    table = ZERO_OFFSET_RAD.copy()
+    for name, deg in (("LL_KFE", left_deg), ("LR_KFE", right_deg)):
+        index = [H_BINDING_BY_ID[mid].name for mid in H_CAN_IDS].index(name)
+        table[index] += np.deg2rad(deg)
+    ZERO_OFFSET_RAD = table
 # D10-13D: a whole-body run that ramps to the fixed stand pose over >= 10 s may
 # start up to this far from it (the policy-target gate stays at 30 deg).
 STAND_RAMP_MAX_DELTA_DEG = 45.0
@@ -2151,6 +2173,35 @@ def report_timing_csv(path):
     print(policy_start_line(records))
 
 
+def sagittal_check_line(records, timing_path, window_s=1.0):
+    """D10-13G: last second before the policy (hold/gate), per leg:
+    sole angle implied by the joints (T265 pitch + HFE+KFE+FFE, sim frame).
+    0 = consistent with a flat sole.  Only meaningful with the feet loaded."""
+    stand = [r for r in records if r["stage"] in ("stand-hold", "stand-gate")]
+    if not stand:
+        return "SAGITTAL CHECK: no stand stage."
+    end = float(stand[-1]["tick"])
+    last = [r for r in stand if float(r["tick"]) > end - window_s]
+    with timing_path.open(newline="", encoding="utf-8") as file:
+        timing = [r for r in csv.DictReader(file) if r["stage"] in ("stand-hold", "stand-gate")
+                  and float(r["tick"]) > end - window_s]
+    pitch = float(np.median([float(r["pitch_fwd_deg"]) for r in timing]))
+    parts = []
+    for leg in ("LL", "LR"):
+        total = 0.0
+        for joint in ("HFE", "KFE", "FFE"):
+            mid = next(m for m in H_CAN_IDS if H_BINDING_BY_ID[m].name == f"{leg}_{joint}")
+            values = [float(r["feedback_position_rad"]) for r in last if int(r["sent_motor_id"], 16) == mid]
+            total += float(np.rad2deg(np.median(values)))
+        ffe = next(m for m in H_CAN_IDS if H_BINDING_BY_ID[m].name == f"{leg}_FFE")
+        load = float(np.median([abs(float(r["feedback_current_h_a"])) for r in last
+                                if int(r["sent_motor_id"], 16) == ffe]))
+        parts.append(f"{leg} joints-say-sole {pitch + total:+.1f}deg (FFE |I| {load:.1f}A"
+                     + (", unloaded" if load < 1.5 else "") + ")")
+    return (f"SAGITTAL CHECK (last {window_s:g}s before the policy, pitch {pitch:+.1f}deg): "
+            + "; ".join(parts) + ". 0 = flat sole; - = joints say toe-up.")
+
+
 def policy_start_line(records):
     """D10-13E: how the first second of the policy stage went, from _timing.csv rows."""
     policy = [(float(r[0]), float(r[8])) for r in records if r[1] == "policy"]
@@ -2374,6 +2425,10 @@ def analyze_csv(csv_path):
     timing_path = timing_csv_path(csv_path)
     if timing_path.exists():
         report_timing_csv(timing_path)
+        try:
+            print(sagittal_check_line(records, timing_path))
+        except Exception as error:
+            print(f"SAGITTAL CHECK failed: {error}")
     abort_path = abort_txt_path(csv_path)
     if abort_path.exists():
         print(f"ABORT RECORD ({abort_path.name}): {abort_path.read_text(encoding='utf-8').strip()}")
@@ -2494,6 +2549,7 @@ def main():
     p.add_argument('--walk-speed-abort-dps', type=float, help=f'D10-13B, with --walk-limits: speed abort in deg/s ({np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f} <= value <= {WALK_SPEED_ABORT_MAX_DPS:g}; default {np.rad2deg(WALK_SPEED_ABORT_RAD_S):.0f}). Needs explicit user approval')
     p.add_argument('--soft-stop-seconds', type=float, help=f'D10-13B, with --walk-limits: after a speed/current/origin abort in the policy stage, hold every axis where it stopped for this long (0 < value <= {SOFT_STOP_MAX_S:g}) before zero MIT')
     p.add_argument('--start-gate-deg', type=float, help=f'D10-13C, with --walk-limits: after --stand-seconds keep holding until the T265 reads |pitch| and |roll| <= G deg for {START_GATE_HOLD_S:g}s, then start the policy ({START_GATE_MIN_DEG:g} <= G <= {START_GATE_MAX_DEG:g}; no policy after {START_GATE_TIMEOUT_S:g}s)')
+    p.add_argument('--knee-trim-deg', type=float, nargs=2, metavar=('LEFT', 'RIGHT'), help=f'D10-13G, with --zero-offset: add LEFT/RIGHT deg to the LL/LR_KFE offset (+ = hold the knee that much straighter; {KNEE_TRIM_MIN_DEG:g}..{KNEE_TRIM_MAX_DEG:g})')
     p.add_argument('--zero-offset', choices=sorted(ZERO_OFFSET_PRESETS_DEG), help='D10-13D, with --all-axes: map the D7 origin (legs straight by eye) to the sim joint zero (CAD pose) with a fixed per-joint offset; see ZERO_OFFSET_PRESETS_DEG')
     p.add_argument('--fine-timer', action='store_true', help='D10-13C: perf_counter loop clock and a 1 ms Windows timer (Python 3.10 time.monotonic steps 15.6 ms)')
     p.add_argument('--command-delay-seconds', type=float, help=f'D10-13, with --walk-limits: keep the velocity command at zero for this long after the policy starts (0 < value <= {COMMAND_DELAY_MAX_S:g}), then use --vx/--vy/--wz')
@@ -2730,6 +2786,17 @@ def main():
         table = set_zero_offset(a.zero_offset)
         print(f"ZERO OFFSET {a.zero_offset}: sim angle = D7-origin angle + offset: "
               + ", ".join(f"{name}={value:+.1f}deg" for name, value in table.items()))
+        if a.knee_trim_deg is not None:
+            try:
+                apply_knee_trim(*a.knee_trim_deg)
+            except ValueError as error:
+                p.error(f'--knee-trim-deg: {error}')
+            print("KNEE TRIM: LL_KFE/LR_KFE offset now "
+                  + "/".join(f"{np.rad2deg(zero_offset_rad(mid)):+.1f}" for mid in (0x1A, 0x12))
+                  + " deg; the stand pose holds the knees "
+                  + "/".join(f"{d:g}" for d in a.knee_trim_deg) + " deg straighter.")
+    elif a.knee_trim_deg is not None:
+        p.error('--knee-trim-deg needs --zero-offset')
     if a.csv and (a.arm or a.preflight) and not a.analyze:
         fresh = unique_csv_path(a.csv)
         if fresh != Path(a.csv):

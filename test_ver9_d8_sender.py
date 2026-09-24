@@ -2211,3 +2211,43 @@ class TiltGainOriginTests(unittest.TestCase):
         line = sender.policy_start_line(rows)
         self.assertIn("peak |pitch| in 0.5s +14.0deg at 0.08s", line)
         self.assertIn("came back to +1.0deg", line)
+
+
+class KneeTrimTests(unittest.TestCase):
+    """D10-13G (2026-09-24): per-leg knee trim on top of the zero offset."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "10", "--zero-offset", "cad_fk"]
+
+    def setUp(self):
+        self.addCleanup(sender.set_zero_offset, None)
+
+    def test_trim_straightens_the_held_knee(self):
+        sender.set_zero_offset("cad_fk")
+        sender.apply_knee_trim(19.0, 16.0)
+        # LL_KFE (sign +1): sim 20 deg now = 20 - (-12.3 + 19) = 13.3 deg from D7.
+        self.assertAlmostEqual(np.rad2deg(sender.wire_command(0x1A, np.deg2rad(20.0))[2]), 13.3, delta=0.1)
+        # LR_KFE (sign -1): 20 - (-7.2 + 16) = 11.2 deg -> motor -11.2.
+        self.assertAlmostEqual(np.rad2deg(sender.wire_command(0x12, np.deg2rad(20.0))[2]), -11.2, delta=0.1)
+        # other joints untouched
+        self.assertAlmostEqual(np.rad2deg(sender.zero_offset_rad(0x2B)), 9.4, places=3)
+        with self.assertRaises(ValueError):
+            sender.apply_knee_trim(26.0, 0.0)
+
+    def test_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [a if a != "x.csv" else str(Path(directory) / "k.csv") for a in self._WALK]
+            out = io.StringIO()
+            with patch.object(sys, "argv", argv + ["--knee-trim-deg", "19", "16"]), \
+                    patch.object(sender, "run"), patch("sys.stdout", out):
+                sender.main()
+            meta = (Path(directory) / "k_meta.txt").read_text(encoding="utf-8")
+        self.assertIn("KNEE TRIM", out.getvalue())
+        self.assertIn("LL_KFE=+6.7", meta)
+        self.assertIn("LR_KFE=+8.8", meta)
+        no_offset = [a for a in self._WALK if a not in ("--zero-offset", "cad_fk")]
+        for argv in (no_offset + ["--knee-trim-deg", "10", "10"], self._WALK + ["--knee-trim-deg", "30", "0"]):
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()
