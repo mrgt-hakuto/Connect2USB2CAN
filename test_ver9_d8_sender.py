@@ -2426,3 +2426,75 @@ class WideLimitsTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     sender.main()
             run.assert_not_called()
+
+
+class RelaxedStartTests(unittest.TestCase):
+    """D10-13M (2026-09-30): --relaxed-start lets a run begin from any hanging pose."""
+
+    _WALK = FloorWalkTests._WALK + ["--duration", "5"]
+
+    def _main(self, argv):
+        out = io.StringIO()
+        with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                patch("sys.stderr", io.StringIO()), patch("sys.stdout", out):
+            sender.main()
+        return run.call_args.kwargs, out.getvalue()
+
+    def _bus_at(self, deg):
+        import time as _time
+
+        def state_for(mid):
+            sign = 1.0 if sender.servo_feedback_to_h_units(1.0, 0.0, mid)[0] > 0 else -1.0
+            return SimpleNamespace(t=_time.time(), err=0, pos=deg * sign, spd=0.0, cur=0.0)
+
+        route_bus = type("Bus", (), {"state": lambda _self, mid: state_for(mid)})()
+        bus = sender.DualBus.__new__(sender.DualBus)
+        bus.bus_by_channel = {0: route_bus, 1: object()}
+        bus.route_by_motor_id = {mid: route_bus for mid in sender.H_CAN_IDS}
+        bus.current_limit_a = {mid: 99.0 for mid in sender.H_CAN_IDS}
+        return bus
+
+    def test_default_run_is_unchanged(self):
+        kw, text = self._main(self._WALK)
+        self.assertFalse(kw["relaxed_start"])
+        self.assertNotIn("RELAXED START", text)
+        with self.assertRaisesRegex(RuntimeError, "origin/pre-arm pose abort"):
+            self._bus_at(60.0).feedback()
+
+    def test_flag_is_passed(self):
+        kw, _ = self._main(self._WALK + ["--relaxed-start"])
+        self.assertTrue(kw["relaxed_start"])
+
+    def test_feedback_uses_only_the_backstop_while_relaxed(self):
+        bus = self._bus_at(60.0)
+        bus.relaxed_start = True
+        bus.feedback()                                   # 60 deg from D7: allowed
+        bus.relaxed_start = False
+        with self.assertRaisesRegex(RuntimeError, "origin/pre-arm pose abort"):
+            bus.feedback()                               # normal rule is back
+        bus = self._bus_at(125.0)
+        bus.relaxed_start = True
+        with self.assertRaisesRegex(RuntimeError, "relaxed-start backstop 120deg.*redo D7"):
+            bus.feedback()
+
+    def test_ramp_is_stretched_to_the_rate_limit(self):
+        start = [0.0] * 10
+        goal = [0.0] * 10
+        goal[3] = np.deg2rad(90.0)
+        self.assertAlmostEqual(sender.relaxed_ramp_seconds(start, goal, 3.0), 6.0)
+        goal[3] = np.deg2rad(30.0)
+        self.assertAlmostEqual(sender.relaxed_ramp_seconds(start, goal, 3.0), 3.0)  # never shorter
+
+    def test_refusals(self):
+        bad = [
+            ["ver9_d8_sender.py", "--arm", "--motor-id", "0x1C", "--package", "x",
+             "--ramp-seconds", "10", "--duration", "2", "--csv", "x.csv", "--relaxed-start"],
+            ["ver9_d8_sender.py", "--arm", "--all-axes", "--package", "x", "--ramp-seconds", "10",
+             "--duration", "2", "--csv", "x.csv", "--policy-slew-dps", "60", "--relaxed-start"],
+        ]
+        for argv in bad:
+            with patch.object(sys, "argv", argv), patch.object(sender, "run") as run, \
+                    patch("sys.stderr", io.StringIO()), patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    sender.main()
+            run.assert_not_called()

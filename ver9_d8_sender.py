@@ -20,7 +20,7 @@ from ver9_shell import FixedCommandSource, MotorFeedback, RealT265, T265_R_OFFSE
 
 HZ = 50.0
 PERIOD = 1.0 / HZ
-BUILD_ID = "D10_13L_WIDE_20260925"
+BUILD_ID = "D10_13M_RELAXEDSTART_20260930"
 STALE_S = 0.30
 # gs_usb resets its USB interface when a Bus is started.  The second adapter
 # needs this full pause after the first one; otherwise python-can may emit a
@@ -271,6 +271,18 @@ STAND_RAMP_MAX_DELTA_DEG = 45.0
 #     gate and soft stop keep the full gains).  Tests the Kt hypothesis: if the
 #     real torque per commanded Kp is 1.0-1.6x the sim, S = 0.7 undoes most of it.
 ORIGIN_BACKSTOP_DEG = 75.0
+# D10-13M (2026-09-30): --relaxed-start.  The 45 deg origin check exists to
+# catch feedback that is no longer in the D7 frame, which only happens after
+# a motor power cycle (AK80-9 is single-encoder: 40/80 deg jumps).  Within one
+# power session the D7 `o 0` frame does not move, so a leg that simply hangs
+# far from straight should not block the start.  With --relaxed-start, until
+# the ramp to the stand pose is complete, only an angle no joint can reach
+# (RELAXED_START_BACKSTOP_DEG from D7) aborts, the pre-arm delta limit is the
+# same backstop, and the ramp is stretched so no axis moves faster than
+# RELAXED_RAMP_MAX_DPS.  After the ramp every normal check is back.  The
+# operator keeps the rule: power cut or motor reboot -> redo D7 `o 0`.
+RELAXED_START_BACKSTOP_DEG = 120.0
+RELAXED_RAMP_MAX_DPS = 15.0
 KFE_HYPEREXTEND_DEG = 10.0
 # D10-13I: with --knee-trim-deg the held knee is only 11-13 deg from straight and
 # the policy's first knee move (-17..-26 deg) passed -10 in 2 of 3 G runs.
@@ -792,6 +804,21 @@ def set_zero_offset(preset):
         raise ValueError(f"unknown joints in zero offset: {sorted(unknown)}")
     ZERO_OFFSET_RAD = np.array([np.deg2rad(table.get(name, 0.0)) for name in names])
     return table
+
+
+def relaxed_ramp_seconds(start, goal, ramp_seconds, max_dps=RELAXED_RAMP_MAX_DPS):
+    """--relaxed-start: the ramp time that keeps every axis at or below max_dps."""
+    largest = max(abs(float(g) - float(s)) for s, g in zip(start, goal))
+    return max(float(ramp_seconds), float(np.rad2deg(largest)) / max_dps)
+
+
+def relaxed_start_violation(d7_rad):
+    """None, or why this D7-frame angle is beyond what any joint can reach."""
+    if abs(d7_rad) > np.deg2rad(RELAXED_START_BACKSTOP_DEG):
+        return (f"{np.rad2deg(d7_rad):+.1f}deg from the D7 origin (relaxed-start backstop "
+                f"{RELAXED_START_BACKSTOP_DEG:g}deg: no joint reaches this; the motor was probably "
+                "power-cycled since D7 -- redo D7 o 0)")
+    return None
 
 
 def zero_offset_rad(motor_id):
@@ -1368,7 +1395,10 @@ class DualBus:
             if s.err: raise RuntimeError(f"motor error 0x{mid:02X} ch={channel}: {s.err}")
             p,v=servo_feedback_to_h_units(s.pos,s.spd,mid)
             centers = getattr(self, "origin_center_rad", None)
-            why = origin_violation(mid, p, None if centers is None else centers[mid])
+            if getattr(self, "relaxed_start", False):
+                why = relaxed_start_violation(p)
+            else:
+                why = origin_violation(mid, p, None if centers is None else centers[mid])
             if why:
                 raise RuntimeError(f"origin/pre-arm pose abort 0x{mid:02X} ch={channel}: {why}. "
                                    "If the leg really is there, no new D7 is needed; if it is not, redo D7 o 0")
@@ -1748,7 +1778,7 @@ def run_haa_sweep(bus, rows, stand_target, close_rad, motor_ids):
     report_haa_sweep(rows)
 
 
-def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False,origin_ref_stand=False,tilt_abort_rad=None,policy_gain_scale=None,clamp_targets=False):
+def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor_ids=H_CAN_IDS,current_limits=None,policy_slew_rad_s=None,stand_seconds=None,stand_only=False,stand_target=STAND_TARGET,haa_close_rad=None,lean_sweep_rad=None,auto_lean_rad=None,speed_abort_rad_s=None,command_delay_s=None,soft_stop_s=None,start_gate_rad=None,fine_timer=False,origin_ref_stand=False,tilt_abort_rad=None,policy_gain_scale=None,clamp_targets=False,relaxed_start=False):
     timer_state = enable_fine_timer() if fine_timer else None
     timing_rows = []
     current_limits = dict(current_limits or default_current_limits())
@@ -1759,6 +1789,11 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
         # D10-13E: the stand pose in the D7 frame (sim angle - offset).
         bus.origin_center_rad = {mid: float(stand_target[i] - ZERO_OFFSET_RAD[i])
                                  for i, mid in enumerate(H_CAN_IDS)}
+    if relaxed_start:
+        bus.relaxed_start = True
+        print(f"RELAXED START: until the stand ramp is done only {RELAXED_START_BACKSTOP_DEG:g}deg "
+              f"from D7 aborts on angle, and the ramp is stretched to <= {RELAXED_RAMP_MAX_DPS:g}deg/s. "
+              "Power cut or motor reboot since D7 -> redo D7 o 0 first.")
     t265=RealT265(T265_R_OFFSET_M); cmd=FixedCommandSource(vx,vy,wz); last=np.zeros(10,np.float32)
     rows=[]; bus_opened=False; t265_start_attempted=False
     abort_message=None
@@ -1806,6 +1841,8 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
                 for mid, target, position in zip(H_CAN_IDS, stand_target, initial_positions)
             ))
         delta_limit = STAND_RAMP_MAX_DELTA_DEG if stand_seconds else ALL_AXES_MAX_DELTA_DEG
+        if relaxed_start:
+            delta_limit = RELAXED_START_BACKSTOP_DEG
         violations = all_axes_prearm_violations(ramp_goal, initial_positions, delta_limit)
         if violations:
             print(f"ALL-AXES PRE-ARM GATE: would REFUSE a whole-body run "
@@ -1831,6 +1868,12 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             raise RuntimeError("--arm requires an explicit --ramp-seconds value")
         if ramp_seconds <= 0:
             raise ValueError("ramp_seconds must be positive")
+        if relaxed_start:
+            stretched = relaxed_ramp_seconds(initial_positions, ramp_goal, ramp_seconds)
+            if stretched > ramp_seconds:
+                print(f"RELAXED START: ramp stretched {ramp_seconds:g}s -> {stretched:.1f}s "
+                      f"(largest move at <= {RELAXED_RAMP_MAX_DPS:g}deg/s).")
+                ramp_seconds = stretched
         selected_id = motor_ids[0]
         selected_index = H_CAN_IDS.index(selected_id)
         wire_kp, wire_kd, initial_wire_target, _wire_vel, _wire_tau = wire_command(
@@ -1894,6 +1937,9 @@ def run(package,duration,csv_path,vx,vy,wz,transmit=True,ramp_seconds=None,motor
             ramp_next += PERIOD
 
         last = initial_out.action_raw
+        if relaxed_start:
+            bus.relaxed_start = False
+            print("RELAXED START: ramp done; the normal origin checks are back from here on.")
         print(f"RAMP complete: CAN tx={bus.tx_count}; entering "
               f"{'stand hold' if stand_seconds else 'policy hold'}.")
         if stand_seconds:
@@ -2637,6 +2683,7 @@ def main():
     p.add_argument('--origin-ref', choices=('d7', 'stand'), default='d7', help='D10-13E, with --walk-limits: measure the 45 deg origin abort from the D7 origin (default) or from the stand pose; stand keeps a 75 deg D7 backstop and a knee hyperextension stop, and requires --tilt-abort-deg')
     p.add_argument('--tilt-abort-deg', type=float, help=f'D10-13E, with --walk-limits: end the policy stage when the T265 |pitch| or |roll| exceeds this ({TILT_ABORT_MIN_DEG:g} <= value <= {TILT_ABORT_MAX_DEG:g}); a soft stop follows if armed')
     p.add_argument('--policy-gain-scale', type=float, help=f'D10-13E, with --walk-limits: Kp and Kd x this in the policy stage only ({POLICY_GAIN_SCALE_MIN:g} <= value <= {POLICY_GAIN_SCALE_MAX:g}); stand hold, gate and soft stop keep full gains')
+    p.add_argument('--relaxed-start', action='store_true', help=f'D10-13M, with --all-axes and --stand-seconds: until the ramp to the stand pose is done, only {RELAXED_START_BACKSTOP_DEG:g} deg from D7 aborts on angle (start from any hanging pose without redoing D7), and the ramp is stretched to <= {RELAXED_RAMP_MAX_DPS:g} deg/s. Normal checks after the ramp. Redo D7 after any power cut')
     p.add_argument('--stand-only', action='store_true', help='with --stand-seconds: stop after the stand hold; no policy stage, no --duration, no --policy-slew-dps')
     p.add_argument('--analyze', type=Path, help='re-judge a saved one-axis CSV offline; opens no CAN bus');    p.add_argument('--preview',action='store_true'); p.add_argument('--package',type=Path); p.add_argument('--duration',type=float,default=0.); p.add_argument('--csv',type=Path); p.add_argument('--vx',type=float,default=0.); p.add_argument('--vy',type=float,default=0.); p.add_argument('--wz',type=float,default=0.); p.add_argument('--ramp-seconds',type=float, help='required with --arm; initial policy target is reached linearly over this time'); p.add_argument('--motor-id', type=lambda value: int(value, 0), action='append', help='required once with --arm; only this registered motor receives MIT frames')
     a=p.parse_args()
@@ -2769,6 +2816,8 @@ def main():
         if not 0 < a.policy_slew_dps <= slew_max:
             p.error(f'--policy-slew-dps must satisfy 0 < value <= {slew_max:g}'
                     + ('' if a.walk_limits else f' ({WALK_POLICY_SLEW_MAX_DPS:g} only with --walk-limits)'))
+    if a.relaxed_start and (not a.all_axes or a.stand_seconds is None or a.hold_pose or a.static_probe):
+        p.error('--relaxed-start needs --all-axes and --stand-seconds (the ramp must go to the stand pose)')
     if a.stand_seconds is not None or a.stand_only:
         if not a.all_axes or a.hold_pose or a.static_probe:
             p.error('--stand-seconds/--stand-only are for a whole-body run: --all-axes, '
@@ -2984,5 +3033,6 @@ def main():
         origin_ref_stand=(a.origin_ref == 'stand'),
         tilt_abort_rad=None if a.tilt_abort_deg is None else float(np.deg2rad(a.tilt_abort_deg)),
         policy_gain_scale=a.policy_gain_scale,
-        clamp_targets=a.safe_clamp)
+        clamp_targets=a.safe_clamp,
+        relaxed_start=a.relaxed_start)
 if __name__=='__main__': sys.exit(main() or 0)
